@@ -268,7 +268,7 @@ struct Controls
     bool  bloomOn  = false; // sw3
     bool  vibrato  = false; // sw4
     bool  effectOn = false; // fs1, latching
-    bool  tapeStop = false; // fs2, held
+    bool  tapeStop = false; // fs2: tap latches, hold is momentary
 };
 
 // ===========================================================================
@@ -320,8 +320,8 @@ struct SlowDrift
     PdLine  modeGain[6];
     int   currentMode = -1;
     // mode 1: harmonic
-    PdLop   f1a, f1b;
-    PdBp    f1bp;
+    PdLop   ladEnvLp;
+    float   lad0 = 0.f, lad1 = 0.f, lad2 = 0.f, lad3 = 0.f, ladEnv = 0.f;
     // mode 2: alt EQ
     PdHip   f2h1, f2h2;
     PdLop   f2l1, f2l2;
@@ -341,6 +341,7 @@ struct SlowDrift
     PdDelay tsPitch;
     PdLine         tsRate, tsTapeGain;
     float          tsDelayMs = 2.f;
+    bool           tsResetPending = false;
     PdPhasor       tsGrain1, tsGrain2;
     bool         tsPrev = false;
     int          tsStage = -1, tsTimer = 0;
@@ -402,14 +403,12 @@ struct SlowDrift
         for(int i = 0; i < 6; i++)
             modeGain[i].Init(sr, i == 0 ? 1.f : 0.f);
 
-        f1a.Init(sr, 1000.f);
-        f1b.Init(sr, 500.f);
-        f1bp.Init(sr, 600.f, 10.f);
+        ladEnvLp.Init(sr, 8.f);
         f2h1.Init(sr, 500.f);
         f2h2.Init(sr, 500.f);
         f2l1.Init(sr, 1800.f);
         f2l2.Init(sr, 1800.f);
-        f2bp.Init(sr, 1000.f, 0.2f);
+        f2bp.Init(sr, 1000.f, 0.6f); // wider, less peaky
         flange.Init(sr, bFlange, SD_FLANGE_LEN);
         flangeMod1.Init(sr, 0.3f);
         flangeMod2.Init(sr, 0.3f);
@@ -517,14 +516,19 @@ struct SlowDrift
         }
         if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
         {
-            // Spinning up leaves an accumulated lag. Bleed it off slightly
-            // fast so the delay walks back to minimum as a slow tape drift.
-            tsRate.Set(1.06f, 20.f);
+            // Spin-up leaves ~200 ms of accumulated lag. Bleeding it off as a
+            // pitch drift left the pedal laggy for seconds, so instead the
+            // delayed voice is crossfaded out, the read head reset, and the
+            // voice faded back in. 90 ms total and the delay is gone.
+            tsRate.Set(1.f, 5.f);
+            tsTapeGain.Set(0.f, 45.f);
             tsStage = 2;
+            tsTimer = (int)(0.045f * sr);
         }
-        if(tsStage == 2 && tsDelayMs <= 2.5f)
+        else if(tsStage == 2 && (tsTimer -= blockSize) <= 0)
         {
-            tsRate.Set(1.f, 20.f);
+            tsResetPending = true;
+            tsTapeGain.Set(1.f, 45.f);
             tsStage = -1;
         }
     }
@@ -545,8 +549,8 @@ struct SlowDrift
         const float knob   = lpgKnob.Process(bloomAmt);
         // Sensitivity raised so transients swing the gate, and the resting
         // floor reduced so it still breathes with the knob near maximum.
-        const float open_  = Clampf(Clampf(env * 14.f, 0.f, 1.f) * knob
-                                        + knob * knob * 0.4f,
+        const float open_  = Clampf(Clampf(env * 10.f, 0.f, 1.f) * knob
+                                        + knob * knob * 0.5f,
                                     0.f, 1.f);
         const float o2     = open_ * open_;
         const float cutoff = o2 * 0.98f + 0.02f; // fully open at the top now
@@ -557,7 +561,10 @@ struct SlowDrift
 
         // ---------------- pre-saturation sum -----------------------------
         // bloom is summed with the dry path, then high-passed at 50 Hz
-        const float x = preHp50.Process(lpg + dry);
+        // With bloom engaged the LPG voice REPLACES the dry path - in the Pd
+        // patch that is what the alt_eq switch did, and summing the dry in
+        // permanently is why the gate sounded like a weak static low pass.
+        const float x = preHp50.Process(c.bloomOn ? lpg : dry);
 
         // ---------------- drive + saturation -----------------------------
         const float drive = driveSm.Process(1.f + c.knob[3] * 24.f);
@@ -658,19 +665,28 @@ struct SlowDrift
         // 0 - clean
         bus += f * g0;
 
-        // 1 - harmonic saturator
+        // 1 - chewy resonant low pass. Four-pole ladder with saturation in
+        //     the feedback path, cutoff tracking the playing envelope so it
+        //     opens on attacks and closes as notes decay.
         {
-            const float d  = FastTanh(f * 1.5f);
-            const float lo = f1b.Process(f1a.Process(d)) * 2.f;
-            const float hi = FastTanh(f1bp.Process(d) * 10.f);
-            bus += (lo + hi) * 0.2f * g1;
+            ladEnv = ladEnvLp.Process(fabsf(f));
+            const float fc  = Clampf(220.f + ladEnv * 4200.f, 120.f, 6000.f);
+            const float g   = Clampf(2.f * sinf(3.14159265f * fc / sr), 0.f, 1.f);
+            const float res = 3.6f;
+            float       u   = f * 1.6f - res * (lad3 - 0.4f * f);
+            u               = FastTanh(u);
+            lad0 += g * (u - lad0);
+            lad1 += g * (lad0 - lad1);
+            lad2 += g * (lad1 - lad2);
+            lad3 += g * (lad2 - lad3);
+            bus += lad3 * 1.9f * g1;
         }
 
         // 2 - alt EQ
         {
             const float band = f2l2.Process(f2l1.Process(f2h2.Process(f2h1.Process(f))));
-            const float peak = f2bp.Process(band) * 6.f;
-            bus += (band + peak) * 0.35f * g2; // was 3.5 dB hotter than the rest
+            const float peak = f2bp.Process(band) * 2.5f; // was 6, too harsh
+            bus += (band + peak) * 0.55f * g2;
         }
 
         // 3 - tape flange
@@ -707,6 +723,11 @@ struct SlowDrift
         tsTape.Write(bus);
         tsPitch.Write(bus);
 
+        if(tsResetPending)
+        {
+            tsDelayMs      = 2.f;
+            tsResetPending = false;
+        }
         const float rate = tsRate.Process();
         tsDelayMs += (1.f - rate) * 1000.f / sr;
         tsDelayMs = Clampf(tsDelayMs, 2.f, 560.f);
@@ -741,6 +762,9 @@ static float               bufTape[SD_TAPE_LEN];
 static float               bufFlange[SD_FLANGE_LEN];
 static float               bufSlap[SD_SLAP_LEN];
 static float               bufTsPitch[SD_TSPITCH_LEN];
+
+uint32_t      fs2Down   = 0;
+bool          tapeLatch = false;
 
 DaisySeed     hw;
 Controls      controls;
@@ -805,7 +829,17 @@ int main(void)
             fsCtl[i].Debounce();
         if(fsCtl[0].RisingEdge())
             controls.effectOn = !controls.effectOn;
-        controls.tapeStop = fsCtl[1].Pressed();
+        // fs2: a quick tap toggles the latch, holding past 400 ms is momentary
+        if(fsCtl[1].RisingEdge())
+            fs2Down = System::GetNow();
+        if(fsCtl[1].FallingEdge())
+        {
+            if(System::GetNow() - fs2Down < 400)
+                tapeLatch = !tapeLatch; // tap
+            else
+                tapeLatch = false; // was a hold
+        }
+        controls.tapeStop = tapeLatch || fsCtl[1].Pressed();
 
         ledOut[0].Write(controls.effectOn);
         ledOut[1].Write(controls.tapeStop);
