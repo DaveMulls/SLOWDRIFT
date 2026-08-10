@@ -210,30 +210,29 @@ struct PdDelay
         buf[wr] = x;
         wr      = (wr + 1) % N;
     }
+    // Sample at delay k, in samples. wr points one past the newest sample.
+    inline float At(int k) const
+    {
+        return buf[((int)wr - 1 - k + 2 * (int)N) % (int)N];
+    }
+    // Catmull-Rom between the samples at delay di and di+1.
     inline float ReadMs(float ms)
     {
         float d = ms * 0.001f * sr;
         if(d < 1.f)
             d = 1.f;
-        if(d > (float)(N - 3))
-            d = (float)(N - 3);
-
-        const int   di   = (int)d;
-        const float frac = d - (float)di;
-
-        const size_t base = (wr + N - (size_t)di) % N;
-        const float  a    = buf[(base + N - 2) % N];
-        const float  b    = buf[(base + N - 1) % N];
-        const float  c    = buf[base % N];
-        const float  dd   = buf[(base + 1) % N];
-
-        const float cminusb = c - b;
-        return b
-               + frac
-                     * (cminusb
-                        - 0.1666667f * (1.f - frac)
-                              * ((dd - a - 3.f * cminusb) * frac
-                                 + (dd + 2.f * a - 3.f * b)));
+        if(d > (float)(N - 4))
+            d = (float)(N - 4);
+        const int   di = (int)d;
+        const float t  = d - (float)di;
+        const float p0 = At(di - 1);
+        const float p1 = At(di);
+        const float p2 = At(di + 1);
+        const float p3 = At(di + 2);
+        return 0.5f
+               * ((2.f * p1) + (-p0 + p2) * t
+                  + (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t * t
+                  + (-p0 + 3.f * p1 - 3.f * p2 + p3) * t * t * t);
     }
 };
 
@@ -291,7 +290,7 @@ struct SlowDrift
     PdRPole lpgP1, lpgP2;
 
     // --- saturation and compressor
-    PdLop   driveSm;
+    PdLop   driveSm, satTilt;
     float compEnvSq = 0.f;
     float compGain  = 1.f;
 
@@ -340,7 +339,8 @@ struct SlowDrift
     // --- tape stop
     PdDelay tsTape;
     PdDelay tsPitch;
-    PdLine         tsSweep, tsTapeGain, tsPitchRate, tsPitchGain;
+    PdLine         tsRate, tsTapeGain;
+    float          tsDelayMs = 2.f;
     PdPhasor       tsGrain1, tsGrain2;
     bool         tsPrev = false;
     int          tsStage = -1, tsTimer = 0;
@@ -374,6 +374,7 @@ struct SlowDrift
         lpgKnob.Init(sr, 10.f);
 
         driveSm.Init(sr, 5.f);
+        satTilt.Init(sr, 12000.f);
 
         tape.Init(sr, bTape, SD_TAPE_LEN);
         wowN1.Init(sr, 0.8f);
@@ -419,10 +420,9 @@ struct SlowDrift
 
         tsTape.Init(sr, bTsTape, SD_TSTAPE_LEN);
         tsPitch.Init(sr, bTsPitch, SD_TSPITCH_LEN);
-        tsSweep.Init(sr, 0.f);
+        tsRate.Init(sr, 1.f);
         tsTapeGain.Init(sr, 1.f);
-        tsPitchRate.Init(sr, 0.001f);
-        tsPitchGain.Init(sr, 0.f);
+        tsDelayMs = 2.f;
         tsGrain1.Init(sr);
         tsGrain2.Init(sr);
         tsGrain2.SetPhase(0.5f);
@@ -492,37 +492,39 @@ struct SlowDrift
             }
         }
 
-        // --- tape stop state machine -------------------------------------
+        // --- tape stop -----------------------------------------------------
+        // Playback rate is what we control; the delay is its integral.
+        //   pitch ratio = 1 - d(delay)/dt
+        // Slowing down therefore means the delay must GROW, and speeding back
+        // up means it must keep growing, only more slowly. Sweeping the delay
+        // back down is what made the restart pitch up instead of down.
         if(c.tapeStop != tsPrev)
         {
             tsPrev = c.tapeStop;
             if(c.tapeStop)
             {
-                tsSweep.Set(1.f, 1000.f);      // read pointer falls back
-                tsTapeGain.Set(0.f, 1000.f);   // tape voice fades out
-                tsPitchGain.Set(0.f, 10.f);
-                tsPitchRate.Set(5.f, 1.f);
+                tsRate.Set(0.f, 900.f);     // decelerate to a halt
+                tsTapeGain.Set(0.f, 1100.f);
                 tsStage = 0;
-                tsTimer = (int)(0.010f * sr);
             }
             else
             {
-                tsSweep.Set(0.f, 400.f); // audible spin back up to speed
+                tsRate.Set(1.f, 350.f);     // accelerate back up: pitch rises
                 tsTapeGain.Set(1.f, 120.f);
-                tsPitchGain.Set(0.f, 200.f);
-                tsStage = -1;
+                tsStage = 1;
+                tsTimer = (int)(0.350f * sr);
             }
         }
-        if(tsStage == 0 && (tsTimer -= blockSize) <= 0)
+        if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
         {
-            tsPitchRate.Set(0.001f, 1000.f); // grain rate collapses
-            tsPitchGain.Set(0.8f, 40.f);
-            tsStage = 1;
-            tsTimer = (int)(1.100f * sr);
+            // Spinning up leaves an accumulated lag. Bleed it off slightly
+            // fast so the delay walks back to minimum as a slow tape drift.
+            tsRate.Set(1.06f, 20.f);
+            tsStage = 2;
         }
-        else if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
+        if(tsStage == 2 && tsDelayMs <= 2.5f)
         {
-            tsPitchGain.Set(0.f, 200.f);
+            tsRate.Set(1.f, 20.f);
             tsStage = -1;
         }
     }
@@ -541,9 +543,13 @@ struct SlowDrift
         const float rel    = lpgRel.Process(rect);
         const float env    = lpgRipple.Process(atk > rel ? atk : rel);
         const float knob   = lpgKnob.Process(bloomAmt);
-        const float open_  = Clampf(Clampf(env * 6.f, 0.f, 1.f) * knob + knob * knob, 0.f, 1.f);
+        // Sensitivity raised so transients swing the gate, and the resting
+        // floor reduced so it still breathes with the knob near maximum.
+        const float open_  = Clampf(Clampf(env * 14.f, 0.f, 1.f) * knob
+                                        + knob * knob * 0.4f,
+                                    0.f, 1.f);
         const float o2     = open_ * open_;
-        const float cutoff = o2 * 0.925f + 0.025f;
+        const float cutoff = o2 * 0.98f + 0.02f; // fully open at the top now
         const float fb     = 1.f - cutoff;
         float       lpg    = lpgP1.Process(lpgIn * cutoff, fb);
         lpg                = lpgP2.Process(lpg * cutoff, fb);
@@ -554,9 +560,18 @@ struct SlowDrift
         const float x = preHp50.Process(lpg + dry);
 
         // ---------------- drive + saturation -----------------------------
-        const float drive = driveSm.Process(1.f + c.knob[3] * 30.f);
-        float       sat   = FastTanh(x * drive) / sqrtf(drive);
-        sat               = satHp1.Process(sat);
+        const float drive = driveSm.Process(1.f + c.knob[3] * 24.f);
+        float pre = x * drive * 0.5f;
+        pre += 0.06f * pre * pre;                 // slight asymmetry, 2nd harmonic
+        // Cubic soft clip: essentially linear at low level, so the knob is
+        // genuinely clean at zero, then thickens progressively.
+        float sat = (pre > 1.f) ? 1.f
+                                : ((pre < -1.f) ? -1.f : 1.5f * (pre - pre * pre * pre / 3.f));
+        sat /= 0.75f * sqrtf(drive);              // level compensation
+        // Tape loses top end as it saturates: 12 kHz down to about 3.5 kHz.
+        satTilt.SetFreq(12000.f - c.knob[3] * 8500.f);
+        sat = satTilt.Process(sat);
+        sat = satHp1.Process(sat);
 
         // ---------------- compressor (env~ 256 style, ratio 80) ----------
         compEnvSq += (sat * sat - compEnvSq) * 0.004f; // ~256-sample window
@@ -564,13 +579,18 @@ struct SlowDrift
         // heavylib's threshold for [hv.compressor~ 80] could not be determined
         // from the patch, so this is a judgement call: 4:1 above -10 dBFS.
         // Hard limiting flattened the saturation knob to inaudibility.
-        const float thr   = 0.3f;
-        const float ratio = 4.f;
-        float       want  = 1.f;
+        // Switch off: gentle 4:1 glue. Switch on: FET-style, low threshold,
+        // 10:1, fast attack and slow release, with makeup to match - obvious
+        // pumping rather than a level change.
+        const float thr    = c.compOn ? 0.06f : 0.3f;
+        const float ratio  = c.compOn ? 10.f : 4.f;
+        float       want   = 1.f;
         if(rms > thr)
             want = powf(thr / rms, 1.f - 1.f / ratio);
-        compGain += (want - compGain) * 0.001f;
-        float comp = sat * compGain * kMakeup * (c.compOn ? 1.3f : 1.f);
+        const float coefUp = c.compOn ? 0.0035f : 0.001f;  // attack
+        const float coefDn = c.compOn ? 0.00012f : 0.001f; // release
+        compGain += (want - compGain) * (want < compGain ? coefUp : coefDn);
+        float comp = sat * compGain * kMakeup * (c.compOn ? 3.2f : 1.f);
         comp       = FastTanh(comp);
         comp       = satHp2.Process(comp);
 
@@ -687,14 +707,10 @@ struct SlowDrift
         tsTape.Write(bus);
         tsPitch.Write(bus);
 
-        const float sweep = tsSweep.Process();
-        const float tsDly = sweep * sweep * 490.f + 2.f;
-        float       stopped = tsTape.ReadMs(tsDly) * tsTapeGain.Process();
-
-        // The granular pitch layer in the Pd subpatch was the most speculative
-        // part of the port and sounded wrong on hardware, so the tape stop is
-        // now purely the read-pointer sweep: as the delay grows the playback
-        // slows and drops in pitch, then fades out. That is the audible effect.
+        const float rate = tsRate.Process();
+        tsDelayMs += (1.f - rate) * 1000.f / sr;
+        tsDelayMs = Clampf(tsDelayMs, 2.f, 560.f);
+        float stopped = tsTape.ReadMs(tsDelayMs) * tsTapeGain.Process();
 
         // ---------------- output -----------------------------------------
         float outv = stopped * (c.knob[0] * 2.f); // noon = unity
