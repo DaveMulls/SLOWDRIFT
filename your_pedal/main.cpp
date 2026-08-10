@@ -544,10 +544,14 @@ struct SlowDrift
         // ---------------- compressor (env~ 256 style, ratio 80) ----------
         compEnvSq += (sat * sat - compEnvSq) * 0.004f; // ~256-sample window
         const float rms  = sqrtf(compEnvSq) + 1e-9f;
-        const float thr  = 0.5f;
-        float       want = 1.f;
+        // heavylib's threshold for [hv.compressor~ 80] could not be determined
+        // from the patch, so this is a judgement call: 4:1 above -10 dBFS.
+        // Hard limiting flattened the saturation knob to inaudibility.
+        const float thr   = 0.3f;
+        const float ratio = 4.f;
+        float       want  = 1.f;
         if(rms > thr)
-            want = thr / rms; // ratio 80:1 is effectively limiting
+            want = powf(thr / rms, 1.f - 1.f / ratio);
         compGain += (want - compGain) * 0.01f;
         float comp = sat * compGain * kMakeup * (c.compOn ? 2.f : 1.f);
         comp       = FastTanh(comp);
@@ -652,6 +656,13 @@ struct SlowDrift
             bus += (f + sv) * g5;
         }
 
+        // ---------------- dry blend --------------------------------------
+        // Pd sums this into the bus ahead of the tape stop, so it is subject
+        // to the tape-stop envelope and the output level knob like everything
+        // else. Adding it after the level control made it far too loud.
+        if(c.dryOn)
+            bus += comp * (0.35f / kMakeup); // Pd taps this pre-makeup
+
         // ---------------- tape stop --------------------------------------
         tsTape.Write(bus);
         tsPitch.Write(bus);
@@ -660,22 +671,13 @@ struct SlowDrift
         const float tsDly = sweep * sweep * 490.f + 2.f;
         float       stopped = tsTape.ReadMs(tsDly) * tsTapeGain.Process();
 
-        const float grate = tsPitchRate.Process();
-        tsGrain1.SetFreq(grate);
-        tsGrain2.SetFreq(grate);
-        const float p1 = tsGrain1.Process();
-        const float p2 = tsGrain2.Process();
-        const float w1 = cosf(6.2831853f * p1) * -0.5f + 0.5f;
-        const float w2 = cosf(6.2831853f * p1) * 0.5f + 0.5f;
-        const float gr = tsPitch.ReadMs(p1 * 100.f + 1.f) * w1
-                         + tsPitch.ReadMs(p2 * 100.f + 1.f) * w2;
-        stopped += gr * tsPitchGain.Process();
+        // The granular pitch layer in the Pd subpatch was the most speculative
+        // part of the port and sounded wrong on hardware, so the tape stop is
+        // now purely the read-pointer sweep: as the delay grows the playback
+        // slows and drops in pitch, then fades out. That is the audible effect.
 
         // ---------------- output -----------------------------------------
         float outv = stopped * (c.knob[0] * 4.f);
-        if(c.dryOn)
-            outv += comp * 0.35f;
-
         outv = outHp.Process(outv);
         return Clampf(outv, -0.99f, 0.99f);
     }
@@ -686,8 +688,10 @@ struct SlowDrift
 // ===========================================================================
 namespace pins
 {
-constexpr Pin KNOB[6] = {seed::A0, seed::A1, seed::A2,
-                         seed::A3, seed::A4, seed::A5};
+// Terrarium knobs sit on A1..A6. Reading A0 (unconnected) made the level
+// control float, which is what was driving the output into distortion.
+constexpr Pin KNOB[6] = {seed::A1, seed::A2, seed::A3,
+                         seed::A4, seed::A5, seed::A6};
 constexpr Pin SWITCH[4]     = {seed::D10, seed::D9, seed::D8, seed::D7};
 constexpr Pin FOOTSWITCH[2] = {seed::D25, seed::D26};
 constexpr Pin LED[2]        = {seed::D22, seed::D23};
