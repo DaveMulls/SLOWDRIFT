@@ -266,7 +266,7 @@ struct Controls
     float knob[6]  = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
-    bool  altEq    = false; // sw3
+    bool  bloomOn  = false; // sw3
     bool  vibrato  = false; // sw4
     bool  effectOn = false; // fs1, latching
     bool  tapeStop = false; // fs2, held
@@ -276,7 +276,7 @@ struct Controls
 // The pedal. No libDaisy types, so this also builds in a desktop WAV harness.
 // ===========================================================================
 // Restores unity after the two 0.5 stages between the tape delay and the bus.
-static constexpr float kMakeup = 4.f;
+static constexpr float kMakeup = 5.5f;
 
 struct SlowDrift
 {
@@ -311,6 +311,9 @@ struct SlowDrift
 
     // --- failure engine
     int   failTimer     = 0;
+    int   dropTimer     = 0;
+    float failAmt       = 0.f;  // latched: knob6 when the bloom switch is OFF
+    float bloomAmt      = 0.f;  // latched: knob6 when the bloom switch is ON
     float dropoutTarget = 1.f;
     PdLop   dropoutSm;
 
@@ -426,7 +429,7 @@ struct SlowDrift
     }
 
     // Control-rate housekeeping. Called once per audio block, not per sample.
-    void UpdateControls(const Controls& c)
+    void UpdateControls(const Controls& c, int blockSize)
     {
         // knob5 selects one of six flavour modes with a 0.5 ms crossfade
         int mode = (int)(c.knob[4] * 6.f);
@@ -443,36 +446,50 @@ struct SlowDrift
         vibLfo.SetFreq(0.15f + c.knob[2] * 6.8f);
         tremLfo.SetFreq(0.5f + c.knob[2] * 14.5f);
 
-        // --- failure engine, driven by knob6 -----------------------------
+        // knob6 drives either bloom or failure depending on the bloom switch.
+        // The inactive one holds its last position rather than following along.
+        if(c.bloomOn)
+            bloomAmt = c.knob[5];
+        else
+            failAmt = c.knob[5];
+
+        // --- failure engine ----------------------------------------------
         // metro period 50..500 ms, shorter as the knob rises
-        const float periodMs = 50.f + (1.f - c.knob[5]) * 450.f;
-        if(--failTimer <= 0)
+        const float periodMs = 50.f + (1.f - failAmt) * 450.f;
+        failTimer -= blockSize;
+        if(failTimer <= 0)
         {
             failTimer = (int)(periodMs * 0.001f * sr);
-            if(c.knob[5] > 0.001f)
+            if(failAmt > 0.001f)
             {
                 const float roll = Rand01();
-                if(roll < c.knob[5] * 0.9f)
-                    dropoutTarget = 0.1f; // dropout
-                else
-                    dropoutTarget = 1.f;
-                if(roll < c.knob[5] * 0.7f && snagTimer < 0)
+                if(roll < failAmt * 0.9f)
+                {
+                    dropoutTarget = 0.1f;
+                    dropTimer     = (int)(0.080f * sr); // Pd restores after 80 ms
+                }
+                if(roll < failAmt * 0.7f && snagTimer < 0)
                     snagTimer = (int)(0.300f * sr); // snag in 300 ms
             }
-            else
+        }
+        if(dropTimer > 0 && (dropTimer -= blockSize) <= 0)
+        {
+            dropoutTarget = 1.f;
+            dropTimer     = 0;
+        }
+        if(snagTimer >= 0 && (snagTimer -= blockSize) <= 0)
+        {
+            snagTime  = 2.f + failAmt * 20.f;
+            snagTimer = -(int)(0.200f * sr);
+        }
+        else if(snagTimer < -1)
+        {
+            snagTimer += blockSize;
+            if(snagTimer >= -1)
             {
-                dropoutTarget = 1.f;
+                snagTimer = -1;
+                snagTime  = 2.f;
             }
-        }
-        if(snagTimer >= 0 && --snagTimer == 0)
-        {
-            snagTime  = 2.f + c.knob[5] * 20.f;
-            snagTimer = -(int)(0.200f * sr); // hold, then release below
-        }
-        if(snagTimer < -1)
-        {
-            if(++snagTimer == -1)
-                snagTime = 2.f;
         }
 
         // --- tape stop state machine -------------------------------------
@@ -490,20 +507,20 @@ struct SlowDrift
             }
             else
             {
-                tsSweep.Set(0.f, 30.f);
-                tsTapeGain.Set(1.f, 200.f);
+                tsSweep.Set(0.f, 400.f); // audible spin back up to speed
+                tsTapeGain.Set(1.f, 120.f);
                 tsPitchGain.Set(0.f, 200.f);
                 tsStage = -1;
             }
         }
-        if(tsStage == 0 && --tsTimer <= 0)
+        if(tsStage == 0 && (tsTimer -= blockSize) <= 0)
         {
             tsPitchRate.Set(0.001f, 1000.f); // grain rate collapses
             tsPitchGain.Set(0.8f, 40.f);
             tsStage = 1;
             tsTimer = (int)(1.100f * sr);
         }
-        else if(tsStage == 1 && --tsTimer <= 0)
+        else if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
         {
             tsPitchGain.Set(0.f, 200.f);
             tsStage = -1;
@@ -523,7 +540,7 @@ struct SlowDrift
         const float atk    = lpgAtk.Process(rect);
         const float rel    = lpgRel.Process(rect);
         const float env    = lpgRipple.Process(atk > rel ? atk : rel);
-        const float knob   = lpgKnob.Process(c.knob[5]);
+        const float knob   = lpgKnob.Process(bloomAmt);
         const float open_  = Clampf(Clampf(env * 6.f, 0.f, 1.f) * knob + knob * knob, 0.f, 1.f);
         const float o2     = open_ * open_;
         const float cutoff = o2 * 0.925f + 0.025f;
@@ -534,11 +551,11 @@ struct SlowDrift
 
         // ---------------- pre-saturation sum -----------------------------
         // bloom is summed with the dry path, then high-passed at 50 Hz
-        const float x = preHp50.Process(lpg + (c.altEq ? 0.f : dry));
+        const float x = preHp50.Process(lpg + dry);
 
         // ---------------- drive + saturation -----------------------------
         const float drive = driveSm.Process(1.f + c.knob[3] * 30.f);
-        float       sat   = FastTanh(x * drive);
+        float       sat   = FastTanh(x * drive) / sqrtf(drive);
         sat               = satHp1.Process(sat);
 
         // ---------------- compressor (env~ 256 style, ratio 80) ----------
@@ -552,15 +569,18 @@ struct SlowDrift
         float       want  = 1.f;
         if(rms > thr)
             want = powf(thr / rms, 1.f - 1.f / ratio);
-        compGain += (want - compGain) * 0.01f;
-        float comp = sat * compGain * kMakeup * (c.compOn ? 2.f : 1.f);
+        compGain += (want - compGain) * 0.001f;
+        float comp = sat * compGain * kMakeup * (c.compOn ? 1.3f : 1.f);
         comp       = FastTanh(comp);
         comp       = satHp2.Process(comp);
 
         // ---------------- wow / vibrato modulation -----------------------
         // noise branch
         float n = wowN3.Process(wowN2.Process(wowN1.Process(noise.Process()))) * 1000.f;
-        n       = Clampf(n, -18.f, 18.f);
+        // clamp the excursion to the pedestal so the sum stays positive and
+        // smooth instead of slamming into the 1 ms floor
+        const float ped = c.knob[2] * 6.f;
+        n               = Clampf(n, -ped, 18.f);
         const float k3   = c.knob[2] / 3.f;
         const float wowN = (n + c.knob[2] * 6.f) * k3;
 
@@ -630,13 +650,13 @@ struct SlowDrift
         {
             const float band = f2l2.Process(f2l1.Process(f2h2.Process(f2h1.Process(f))));
             const float peak = f2bp.Process(band) * 6.f;
-            bus += (band + peak) * 0.5f * g2;
+            bus += (band + peak) * 0.35f * g2; // was 3.5 dB hotter than the rest
         }
 
         // 3 - tape flange
         {
             const float mt = flangeMod2.Process(flangeMod1.Process(noise.Process()));
-            const float fd = 7.f + mt * 5.f;
+            const float fd = 7.f + Clampf(mt * 600.f, -5.f, 5.f);
             const float fv = flange.ReadMs(Clampf(fd, 1.f, 14.f));
             flange.Write(f + fv * 0.2f);
             bus += (f + fv) * 0.6f * g3;
@@ -661,7 +681,7 @@ struct SlowDrift
         // to the tape-stop envelope and the output level knob like everything
         // else. Adding it after the level control made it far too loud.
         if(c.dryOn)
-            bus += comp * (0.35f / kMakeup); // Pd taps this pre-makeup
+            bus += comp * 0.25f; // roughly level with the wet bus
 
         // ---------------- tape stop --------------------------------------
         tsTape.Write(bus);
@@ -677,7 +697,7 @@ struct SlowDrift
         // slows and drops in pitch, then fades out. That is the audible effect.
 
         // ---------------- output -----------------------------------------
-        float outv = stopped * (c.knob[0] * 4.f);
+        float outv = stopped * (c.knob[0] * 2.f); // noon = unity
         outv = outHp.Process(outv);
         return Clampf(outv, -0.99f, 0.99f);
     }
@@ -718,7 +738,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
 {
-    pedal.UpdateControls(controls);
+    pedal.UpdateControls(controls, (int)size / 2);
     for(size_t i = 0; i < size; i += 2)
     {
         const float s = pedal.Process(in[i], controls);
@@ -762,7 +782,7 @@ int main(void)
             swCtl[i].Debounce();
         controls.dryOn   = swCtl[0].Pressed();
         controls.compOn  = swCtl[1].Pressed();
-        controls.altEq   = swCtl[2].Pressed();
+        controls.bloomOn = swCtl[2].Pressed();
         controls.vibrato = swCtl[3].Pressed();
 
         for(int i = 0; i < 2; i++)
