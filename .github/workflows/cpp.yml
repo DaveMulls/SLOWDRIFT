@@ -6,7 +6,6 @@ on:
 
 env:
   # CHANGE THIS to the name of the folder your main.cpp and Makefile live in.
-  # In the unmodified template that folder is called "your_pedal".
   PEDAL_DIR: your_pedal
 
 jobs:
@@ -15,14 +14,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Install ARM compiler
         uses: carlosperate/arm-none-eabi-gcc-action@v1
         with:
-          release: '12.3.Rel1'
+          # Pinned to the release Electrosmith targets. Newer compilers reject
+          # DaisySP's sources over missing <limits> includes.
+          release: '10.3-2021.10'
 
       - name: Fetch Daisy libraries if they are missing
         run: |
@@ -32,6 +33,14 @@ jobs:
           if [ ! -f DaisySP/Makefile ]; then
             git clone --depth 1 --recursive https://github.com/electro-smith/DaisySP
           fi
+
+      - name: Add missing <limits> includes
+        # Harmless on the pinned compiler; keeps the build working if the
+        # toolchain is ever bumped.
+        run: |
+          for f in $(grep -rl 'numeric_limits' DaisySP/Source libDaisy/src 2>/dev/null); do
+            grep -q '#include <limits>' "$f" || sed -i '1i #include <limits>' "$f"
+          done
 
       - name: Build libDaisy
         run: make -C libDaisy -j4
@@ -43,7 +52,7 @@ jobs:
         run: make -C "$PEDAL_DIR" -j4
 
       - name: Upload firmware
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: firmware
           path: |
