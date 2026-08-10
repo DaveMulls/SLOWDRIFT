@@ -2,7 +2,7 @@
 TARGET = your_pedal
 
 # Sources
-CPP_SOURCES = your_pedal.cpp
+CPP_SOURCES = main.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../libDaisy
