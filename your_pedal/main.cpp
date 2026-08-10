@@ -47,7 +47,7 @@ static inline float FastTanh(float x)
 }
 
 // Pd [lop~] : coef = clamp(2*pi*fc/sr, 0, 1); y += coef * (x - y)
-struct Lop
+struct PdLop
 {
     float coef = 0.f, z = 0.f, sr = 48000.f;
     void  Init(float sampleRate, float fc)
@@ -67,16 +67,16 @@ struct Lop
 // Pd [hip~] response, computed as x - lowpass(x).
 // Mathematically the same one-pole high pass, but without the huge internal
 // accumulator that costs precision in 32-bit float at low cutoffs.
-struct Hip
+struct PdHip
 {
-    Lop  lp;
+    PdLop  lp;
     void Init(float sr, float fc) { lp.Init(sr, fc); }
     void SetFreq(float fc) { lp.SetFreq(fc); }
     inline float Process(float x) { return x - lp.Process(x); }
 };
 
 // Pd [bp~] : two-pole resonator
-struct Bp
+struct PdBp
 {
     float coef1 = 0.f, coef2 = 0.f, gain = 0.f;
     float last = 0.f, prev = 0.f, sr = 48000.f;
@@ -121,7 +121,7 @@ struct Bp
 };
 
 // Pd [rpole~] : y[n] = x[n] + a * y[n-1]
-struct RPole
+struct PdRPole
 {
     float y = 0.f;
     inline float Process(float x, float a)
@@ -132,7 +132,7 @@ struct RPole
 };
 
 // Pd [line~] : linear ramp to a target over a time in ms
-struct Line
+struct PdLine
 {
     float value = 0.f, target = 0.f, inc = 0.f, sr = 48000.f;
     int   samplesLeft = 0;
@@ -170,7 +170,7 @@ struct Line
 };
 
 // Pd [phasor~] : 0..1 ramp
-struct Phasor
+struct PdPhasor
 {
     float phase = 0.f, inc = 0.f, sr = 48000.f;
     void  Init(float sampleRate) { sr = sampleRate; }
@@ -189,7 +189,7 @@ struct Phasor
 
 // Pd [delwrite~] / [vd~] with 4-point cubic interpolation, as vd~ uses.
 // The buffer is supplied externally so the caller decides which RAM it lives in.
-struct Delay
+struct PdDelay
 {
     float* buf = nullptr;
     size_t N   = 0;
@@ -248,7 +248,7 @@ enum : size_t
 };
 
 // Pd [noise~]
-struct Noise
+struct PdNoise
 {
     uint32_t state = 22222;
     inline float Process()
@@ -283,27 +283,27 @@ struct SlowDrift
     float sr = 48000.f;
 
     // --- input / output conditioning
-    Hip inHp, outHp, preHp50, satHp1, satHp2;
+    PdHip inHp, outHp, preHp50, satHp1, satHp2;
 
     // --- bloom (lpg_engine)
-    Hip   lpgHp;
-    Lop   lpgAtk, lpgRel, lpgRipple, lpgKnob;
-    RPole lpgP1, lpgP2;
+    PdHip   lpgHp;
+    PdLop   lpgAtk, lpgRel, lpgRipple, lpgKnob;
+    PdRPole lpgP1, lpgP2;
 
     // --- saturation and compressor
-    Lop   driveSm;
+    PdLop   driveSm;
     float compEnvSq = 0.f;
     float compGain  = 1.f;
 
     // --- tape delay and wow
-    Delay tape;
-    Noise       noise;
-    Lop         wowN1, wowN2, wowN3;   // noise~ -> lop 0.8 / 15 / 8
-    Line        walkLine;              // random-walk target ramp
-    Lop         walkS1, walkS2, walkHp;
-    Phasor      sine1, sine2, sine3;   // 0.61 / 1.07 / 1.83 Hz
-    Phasor      vibLfo;
-    Lop         vibDepth, altDepth, snagSm1, snagSm2;
+    PdDelay tape;
+    PdNoise       noise;
+    PdLop         wowN1, wowN2, wowN3;   // noise~ -> lop 0.8 / 15 / 8
+    PdLine        walkLine;              // random-walk target ramp
+    PdLop         walkS1, walkS2, walkHp;
+    PdPhasor      sine1, sine2, sine3;   // 0.61 / 1.07 / 1.83 Hz
+    PdPhasor      vibLfo;
+    PdLop         vibDepth, altDepth, snagSm1, snagSm2;
     float       walkTarget = 0.f;
     int         walkTimer  = 0;
     float       snagTime   = 2.f;
@@ -312,33 +312,33 @@ struct SlowDrift
     // --- failure engine
     int   failTimer     = 0;
     float dropoutTarget = 1.f;
-    Lop   dropoutSm;
+    PdLop   dropoutSm;
 
     // --- flavour bus
-    Line  modeGain[6];
+    PdLine  modeGain[6];
     int   currentMode = -1;
     // mode 1: harmonic
-    Lop   f1a, f1b;
-    Bp    f1bp;
+    PdLop   f1a, f1b;
+    PdBp    f1bp;
     // mode 2: alt EQ
-    Hip   f2h1, f2h2;
-    Lop   f2l1, f2l2;
-    Bp    f2bp;
+    PdHip   f2h1, f2h2;
+    PdLop   f2l1, f2l2;
+    PdBp    f2bp;
     // mode 3: tape flange
-    Delay flange;
-    Lop         flangeMod1, flangeMod2;
+    PdDelay flange;
+    PdLop         flangeMod1, flangeMod2;
     // mode 4: tremolo
-    Phasor tremLfo;
-    Lop    tremDepth;
+    PdPhasor tremLfo;
+    PdLop    tremDepth;
     // mode 5: slap
-    Delay slap;
-    Lop         slapLp;
+    PdDelay slap;
+    PdLop         slapLp;
 
     // --- tape stop
-    Delay tsTape;
-    Delay tsPitch;
-    Line         tsSweep, tsTapeGain, tsPitchRate, tsPitchGain;
-    Phasor       tsGrain1, tsGrain2;
+    PdDelay tsTape;
+    PdDelay tsPitch;
+    PdLine         tsSweep, tsTapeGain, tsPitchRate, tsPitchGain;
+    PdPhasor       tsGrain1, tsGrain2;
     bool         tsPrev = false;
     int          tsStage = -1, tsTimer = 0;
 
