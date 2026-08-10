@@ -188,16 +188,19 @@ struct Phasor
 };
 
 // Pd [delwrite~] / [vd~] with 4-point cubic interpolation, as vd~ uses.
-template <size_t N>
+// The buffer is supplied externally so the caller decides which RAM it lives in.
 struct Delay
 {
-    float  buf[N];
-    size_t wr = 0;
-    float  sr = 48000.f;
+    float* buf = nullptr;
+    size_t N   = 0;
+    size_t wr  = 0;
+    float  sr  = 48000.f;
 
-    void Init(float sampleRate)
+    void Init(float sampleRate, float* buffer, size_t len)
     {
-        sr = sampleRate;
+        sr  = sampleRate;
+        buf = buffer;
+        N   = len;
         for(size_t i = 0; i < N; i++)
             buf[i] = 0.f;
         wr = 0;
@@ -224,7 +227,6 @@ struct Delay
         const float  c    = buf[base % N];
         const float  dd   = buf[(base + 1) % N];
 
-        // Pd's 4-point cubic
         const float cminusb = c - b;
         return b
                + frac
@@ -233,6 +235,16 @@ struct Delay
                               * ((dd - a - 3.f * cminusb) * frac
                                  + (dd + 2.f * a - 3.f * b)));
     }
+};
+
+// Buffer lengths at 48 kHz
+enum : size_t
+{
+    SD_TAPE_LEN    = 6200,  //  128 ms
+    SD_FLANGE_LEN  = 800,   //   15 ms
+    SD_SLAP_LEN    = 7400,  //  150 ms
+    SD_TSTAPE_LEN  = 29000, //  600 ms - the big one, put this in SDRAM
+    SD_TSPITCH_LEN = 6200   //  128 ms
 };
 
 // Pd [noise~]
@@ -263,6 +275,9 @@ struct Controls
 // ===========================================================================
 // The pedal. No libDaisy types, so this also builds in a desktop WAV harness.
 // ===========================================================================
+// Restores unity after the two 0.5 stages between the tape delay and the bus.
+static constexpr float kMakeup = 4.f;
+
 struct SlowDrift
 {
     float sr = 48000.f;
@@ -281,7 +296,7 @@ struct SlowDrift
     float compGain  = 1.f;
 
     // --- tape delay and wow
-    Delay<6200> tape;
+    Delay tape;
     Noise       noise;
     Lop         wowN1, wowN2, wowN3;   // noise~ -> lop 0.8 / 15 / 8
     Line        walkLine;              // random-walk target ramp
@@ -310,18 +325,18 @@ struct SlowDrift
     Lop   f2l1, f2l2;
     Bp    f2bp;
     // mode 3: tape flange
-    Delay<800>  flange;
+    Delay flange;
     Lop         flangeMod1, flangeMod2;
     // mode 4: tremolo
     Phasor tremLfo;
     Lop    tremDepth;
     // mode 5: slap
-    Delay<7400> slap;
+    Delay slap;
     Lop         slapLp;
 
     // --- tape stop
-    Delay<29000> tsTape;
-    Delay<6200>  tsPitch;
+    Delay tsTape;
+    Delay tsPitch;
     Line         tsSweep, tsTapeGain, tsPitchRate, tsPitchGain;
     Phasor       tsGrain1, tsGrain2;
     bool         tsPrev = false;
@@ -334,7 +349,12 @@ struct SlowDrift
         return (float)(rng >> 8) * (1.f / 16777216.f);
     }
 
-    void Init(float sampleRate)
+    void Init(float sampleRate,
+              float* bTape,
+              float* bFlange,
+              float* bSlap,
+              float* bTsTape,
+              float* bTsPitch)
     {
         sr = sampleRate;
 
@@ -352,7 +372,7 @@ struct SlowDrift
 
         driveSm.Init(sr, 5.f);
 
-        tape.Init(sr);
+        tape.Init(sr, bTape, SD_TAPE_LEN);
         wowN1.Init(sr, 0.8f);
         wowN2.Init(sr, 15.f);
         wowN3.Init(sr, 8.f);
@@ -386,16 +406,16 @@ struct SlowDrift
         f2l1.Init(sr, 1800.f);
         f2l2.Init(sr, 1800.f);
         f2bp.Init(sr, 1000.f, 0.2f);
-        flange.Init(sr);
+        flange.Init(sr, bFlange, SD_FLANGE_LEN);
         flangeMod1.Init(sr, 0.3f);
         flangeMod2.Init(sr, 0.3f);
         tremLfo.Init(sr);
         tremDepth.Init(sr, 10.f);
-        slap.Init(sr);
+        slap.Init(sr, bSlap, SD_SLAP_LEN);
         slapLp.Init(sr, 4000.f);
 
-        tsTape.Init(sr);
-        tsPitch.Init(sr);
+        tsTape.Init(sr, bTsTape, SD_TSTAPE_LEN);
+        tsPitch.Init(sr, bTsPitch, SD_TSPITCH_LEN);
         tsSweep.Init(sr, 0.f);
         tsTapeGain.Init(sr, 1.f);
         tsPitchRate.Init(sr, 0.001f);
@@ -524,12 +544,12 @@ struct SlowDrift
         // ---------------- compressor (env~ 256 style, ratio 80) ----------
         compEnvSq += (sat * sat - compEnvSq) * 0.004f; // ~256-sample window
         const float rms  = sqrtf(compEnvSq) + 1e-9f;
-        const float thr  = 0.1f;
+        const float thr  = 0.5f;
         float       want = 1.f;
         if(rms > thr)
             want = thr / rms; // ratio 80:1 is effectively limiting
         compGain += (want - compGain) * 0.01f;
-        float comp = sat * compGain * (c.compOn ? 2.f : 1.f);
+        float comp = sat * compGain * kMakeup * (c.compOn ? 2.f : 1.f);
         comp       = FastTanh(comp);
         comp       = satHp2.Process(comp);
 
@@ -673,6 +693,15 @@ constexpr Pin FOOTSWITCH[2] = {seed::D25, seed::D26};
 constexpr Pin LED[2]        = {seed::D22, seed::D23};
 } // namespace pins
 
+// The 600 ms tape-stop buffer is 113 KB and will not fit in DTCMRAM alongside
+// the others, so it lives in the Seed's external SDRAM. The rest total 56 KB
+// and stay in fast internal RAM.
+static float DSY_SDRAM_BSS bufTsTape[SD_TSTAPE_LEN];
+static float               bufTape[SD_TAPE_LEN];
+static float               bufFlange[SD_FLANGE_LEN];
+static float               bufSlap[SD_SLAP_LEN];
+static float               bufTsPitch[SD_TSPITCH_LEN];
+
 DaisySeed     hw;
 Controls      controls;
 SlowDrift     pedal;
@@ -701,7 +730,7 @@ int main(void)
     hw.SetAudioBlockSize(2);
 
     const float sr = hw.AudioSampleRate();
-    pedal.Init(sr);
+    pedal.Init(sr, bufTape, bufFlange, bufSlap, bufTsTape, bufTsPitch);
 
     AdcChannelConfig adcCfg[6];
     for(int i = 0; i < 6; i++)
