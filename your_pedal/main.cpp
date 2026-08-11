@@ -430,6 +430,7 @@ struct SlowDrift
     PdHip   lpgHp;
     PdLop   lpgAtk, lpgRel, lpgRipple, lpgKnob;
     float   lpgOpen = 0.f;
+    float   lpgPeak = 0.f;
     PdRPole lpgP1, lpgP2;
 
     // --- saturation and compressor
@@ -736,12 +737,30 @@ struct SlowDrift
         // Sensitivity 6, as in the Pd patch. Raising it to 18 pinned the
         // envelope at full scale two thirds of the time, which left the gate
         // permanently open and made the whole thing a static low pass.
-        const float env  = Clampf(envRaw * 6.f, 0.f, 1.f);
+        // A fixed sensitivity into a hard clip only works for one input
+        // level. At 6x, any real pickup pins the envelope at full scale for
+        // the loud half of every note - so the gate froze exactly while you
+        // could hear it and only started moving once the note had died. The
+        // reference level is tracked instead: fast up, ~2.5 s down, so the
+        // gate uses its whole range whether you play single coils or a hot
+        // humbucker, and still answers to how hard you hit relative to how
+        // you have been playing.
+        if(rect > lpgPeak)
+            lpgPeak += (rect - lpgPeak) * 0.004f;   // ~4 ms
+        else
+            lpgPeak += (rect - lpgPeak) * 0.0000026f; // ~8 s
+        const float ref    = lpgPeak * 0.35f + 0.003f;
+        const float envRel = envRaw / ref;
+        // Asymptotic rather than clipped: digging in pushes it closer to fully
+        // open but never actually pins it, so the gate keeps breathing.
+        const float env  = envRel / (0.6f + envRel);
         const float knob = lpgKnob.Process(bloomAmt);
-        // knob * env is the swinging part; knob^2 is a resting floor, so that
-        // fully clockwise pins the gate open and fully anticlockwise closes it
-        // down to a 190 Hz whisper.
-        lpgOpen = Clampf(env * knob + knob * knob, 0.f, 1.f);
+        // Fairfield: "the LPG control adjusts the level of the envelope going
+        // to the low pass filter and gate". So the knob scales the envelope
+        // rather than adding a resting floor - a floor is exactly what stops
+        // the gate moving. Turned down the filter sits dark and chokes notes;
+        // turned up the envelope swings it across its whole range.
+        lpgOpen = Clampf(env * knob * 1.3f, 0.f, 1.f);
 
         // ---------------- pre-saturation sum -----------------------------
         // bloom is summed with the dry path, then high-passed at 50 Hz
@@ -930,12 +949,18 @@ struct SlowDrift
         // an LPG sound different from a plain filter.
         if(c.bloomOn)
         {
-            const float o2     = lpgOpen * lpgOpen; // vactrol-ish curve
-            const float cutoff = o2 * 0.925f + 0.025f;
+            // Cubed rather than squared: a vactrol's response is steeper than
+            // a square law near the closed end, and it buys several more
+            // octaves of travel where the ear notices it.
+            const float o3     = lpgOpen * lpgOpen * lpgOpen;
+            const float cutoff = 0.022f + o3 * 0.93f;
             const float fb     = 1.f - cutoff;
             float       g      = lpgP1.Process(bus * cutoff, fb);
             g                  = lpgP2.Process(g * cutoff, fb);
-            bus                = g * (lpgOpen * 0.65f + 0.35f);
+            // The VCA moves with the filter - brightness and loudness
+            // together is what separates an LPG from a plain filter. A 0.35
+            // floor only gave about 3 dB of swell; 0.18 gives nearer 10.
+            bus                = g * (0.18f + 0.82f * lpgOpen);
         }
 
         // ---------------- dry blend --------------------------------------
