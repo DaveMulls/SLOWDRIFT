@@ -24,6 +24,9 @@
 //     knob1  how much dry the dry switch passes
 //     knob2  lag: glide time between modulation values
 //     knob3  modulation waveshape: sine / triangle / sample+hold / saw
+//     knob4  EQ low    +/-12 dB, flat at noon
+//     knob5  EQ mid    +/-18 dB at 775 Hz, flat at noon
+//     knob6  EQ high   +/-12 dB, flat at noon
 
 #include "daisy_seed.h"
 #include "daisysp.h"
@@ -123,6 +126,31 @@ struct PdBp
         prev               = last;
         last               = output;
         return gain * output;
+    }
+};
+
+// True two-pole bandpass (topology preserving state variable). Unlike Pd's
+// [bp~], which is an all-pole resonator with a lowpass tail, this has a zero
+// at DC - essential for a mid EQ band that is not to lift the bass with it.
+struct SvfBand
+{
+    float ic1 = 0.f, ic2 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    void  Init(float sr, float fc, float q)
+    {
+        const float g = tanf(3.14159265f * fc / sr), k = 1.f / q;
+        a1            = 1.f / (1.f + g * (g + k));
+        a2            = g * a1;
+        a3            = g * a2;
+        ic1 = ic2 = 0.f;
+    }
+    inline float Process(float x)
+    {
+        const float v3 = x - ic2;
+        const float v1 = a1 * ic1 + a2 * v3;
+        const float v2 = ic2 + a2 * ic1 + a3 * v3;
+        ic1            = 2.f * v1 - ic1;
+        ic2            = 2.f * v2 - ic2;
+        return v1; // bandpass, unity at fc
     }
 };
 
@@ -237,8 +265,8 @@ struct ShapedLfo
     }
     void SetFreq(float f) { ph.SetFreq(f); }
 
-    // lagAmount 0..1 sweeps the slew from fcTop down to half a hertz
-    inline float Process(int shape, float lagAmount)
+    // Advance the phase and return the shape, with no slew applied.
+    inline float Raw(int shape)
     {
         const float p = ph.Process();
         if(p < prevPhase) // phase wrapped: latch a new random step
@@ -248,12 +276,13 @@ struct ShapedLfo
         }
         prevPhase = p;
 
-        const float raw = (shape == LFO_SH) ? shValue : LfoWave(p, shape);
+        return (shape == LFO_SH) ? shValue : LfoWave(p, shape);
+    }
 
-        // Lag is scaled to the LFO period, not to an absolute frequency, so
-        // "half lag" glides over half a cycle whether the LFO is at 0.5 Hz or
-        // 15 Hz. Mapping it linearly in time keeps the useful range spread
-        // across the whole knob instead of bunched at the top.
+    // Lag is scaled to the LFO period, not an absolute frequency, so "half
+    // lag" glides over half a cycle whether the LFO is at 0.5 Hz or 15 Hz.
+    inline float Lagged(float raw, float lagAmount)
+    {
         const float hz       = ph.inc * ph.sr;
         const float periodMs = 1000.f / (hz > 0.05f ? hz : 0.05f);
         const float lagMs    = lagAmount * periodMs * 0.5f;
@@ -262,6 +291,11 @@ struct ShapedLfo
                                    : (159.155f / lagMs < fcTop ? 159.155f / lagMs : fcTop);
         lag.SetFreq(fc);
         return lag.Process(raw);
+    }
+
+    inline float Process(int shape, float lagAmount)
+    {
+        return Lagged(Raw(shape), lagAmount);
     }
 };
 
@@ -349,6 +383,12 @@ struct Controls
     int   lfoShape  = LFO_SINE; // knob 3 while both footswitches are held
     float wowDepth  = 0.3f; // knob 2 normally
     float lag       = 0.f;  // knob 2 while both footswitches are held
+    float sat       = 0.3f; // knob 4 normally
+    float flavour   = 0.f;  // knob 5 normally
+    float fail      = 0.f;  // knob 6 normally
+    float eqLow     = 0.5f; // knob 4 on the alt layer, 0.5 = flat
+    float eqMid     = 0.5f; // knob 5 on the alt layer, 0.5 = flat
+    float eqHigh    = 0.5f; // knob 6 on the alt layer, 0.5 = flat
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
     bool  bloomOn  = false; // sw3
@@ -369,6 +409,8 @@ struct SlowDrift
 
     // --- input / output conditioning
     PdHip inHp, outHp, preHp50, satHp1, satHp2;
+    PdLop eqLowLp, eqHighLp;
+    SvfBand eqMidBp;
 
     // --- bloom (lpg_engine)
     PdHip   lpgHp;
@@ -387,7 +429,7 @@ struct SlowDrift
     PdLine        walkLine;              // random-walk target ramp
     PdLop         walkS1, walkS2, walkHp;
     PdPhasor      sine1, sine2, sine3;   // 0.61 / 1.07 / 1.83 Hz
-    ShapedLfo     vibLfo;
+    ShapedLfo     vibLfo, wowLfo;
     PdLop         vibDepth, altDepth, snagSm1, snagSm2;
     float       walkTarget = 0.f;
     int         walkTimer  = 0;
@@ -452,6 +494,9 @@ struct SlowDrift
         inHp.Init(sr, 10.f);
         outHp.Init(sr, 10.f);
         preHp50.Init(sr, 50.f);
+        eqLowLp.Init(sr, 120.f);
+        eqHighLp.Init(sr, 2500.f);
+        eqMidBp.Init(sr, 775.f, 0.85f);
         satHp1.Init(sr, 30.f);
         satHp2.Init(sr, 10.f);
 
@@ -481,6 +526,7 @@ struct SlowDrift
         sine3.SetFreq(1.19f);
         sine3.SetPhase(0.71f);
         vibLfo.Init(sr, 0x9E3779B9u, 60.f);
+        wowLfo.Init(sr, 0xC2B2AE35u, 40.f);
         vibDepth.Init(sr, 10.f);
         altDepth.Init(sr, 20.f);
         snagSm1.Init(sr, 1.f);
@@ -529,7 +575,7 @@ struct SlowDrift
     void UpdateControls(const Controls& c, int blockSize)
     {
         // knob5 selects one of six flavour modes with a 0.5 ms crossfade
-        int mode = (int)(c.knob[4] * 6.f);
+        int mode = (int)(c.flavour * 6.f);
         if(mode > 5)
             mode = 5;
         if(mode != currentMode)
@@ -541,14 +587,15 @@ struct SlowDrift
 
         // LFO rates follow knob3
         vibLfo.SetFreq(0.15f + c.rate * 6.8f);
+        wowLfo.SetFreq(0.25f + c.rate * 2.5f); // wow rates, slower than vibrato
         tremLfo.SetFreq(0.5f + c.rate * 14.5f);
 
         // knob6 drives either bloom or failure depending on the bloom switch.
         // The inactive one holds its last position rather than following along.
         if(c.bloomOn)
-            bloomAmt = c.knob[5];
+            bloomAmt = c.fail;
         else
-            failAmt = c.knob[5];
+            failAmt = c.fail;
 
         // --- failure engine ----------------------------------------------
         // metro period 50..500 ms, shorter as the knob rises
@@ -678,7 +725,7 @@ struct SlowDrift
         const float x = preHp50.Process(c.bloomOn ? lpg : dry);
 
         // ---------------- drive + saturation -----------------------------
-        const float drive = driveSm.Process(1.f + c.knob[3] * 24.f);
+        const float drive = driveSm.Process(1.f + c.sat * 24.f);
         float pre = x * drive * 0.5f;
         pre += 0.06f * pre * pre;                 // slight asymmetry, 2nd harmonic
         // Cubic soft clip: essentially linear at low level, so the knob is
@@ -687,7 +734,7 @@ struct SlowDrift
                                 : ((pre < -1.f) ? -1.f : 1.5f * (pre - pre * pre * pre / 3.f));
         sat /= 0.75f * sqrtf(drive);              // level compensation
         // Tape loses top end as it saturates: 12 kHz down to about 3.5 kHz.
-        satTilt.SetFreq(12000.f - c.knob[3] * 8500.f);
+        satTilt.SetFreq(12000.f - c.sat * 8500.f);
         sat = satTilt.Process(sat);
         sat = satHp1.Process(sat);
 
@@ -739,7 +786,17 @@ struct SlowDrift
                         * 0.221f;
 
         const float depth = altDepth.Process(c.wowDepth);
-        const float mod   = Clampf(w + s, -1.f, 1.f);
+
+        // At the sine setting the wow is the tuned tape modulator: three slow
+        // LFOs plus the high-passed random walk. Any other shape swaps in a
+        // single shaped LFO so triangle, sample-and-hold and saw actually
+        // reach the tape delay. Lag applies either way - previously it only
+        // touched the vibrato and tremolo LFOs, which is why it did nothing
+        // unless one of those was engaged.
+        const float rawMod = (c.lfoShape == LFO_SINE)
+                                 ? Clampf(w + s, -1.f, 1.f)
+                                 : wowLfo.Raw(c.lfoShape);
+        const float mod    = Clampf(wowLfo.Lagged(rawMod, c.lag), -1.f, 1.f);
         const float wowA  = mod * depth * 5.f + depth * 5.f;
 
         // vibrato branch (replaces wow when sw4 is up)
@@ -851,7 +908,23 @@ struct SlowDrift
         float stopped = tsTape.ReadMs(tsDelayMs) * tsTapeGain.Process();
 
         // ---------------- output -----------------------------------------
-        float outv = stopped * (c.volume * 2.f); // noon = unity
+        // ---------------- EQ, after the Condor -----------------------------
+        // Bass +/-12 dB shelf, parametric-style mid +/-18 dB at 775 Hz (the
+        // geometric centre of the Condor's 150 Hz - 4 kHz mid sweep), treble
+        // +/-12 dB shelf. All flat at noon.
+        float eqd = stopped;
+        if(c.eqLow != 0.5f || c.eqMid != 0.5f || c.eqHigh != 0.5f)
+        {
+            const float gL = powf(4.f, (c.eqLow - 0.5f) * 2.f);
+            const float gM = powf(8.f, (c.eqMid - 0.5f) * 2.f);
+            const float gH = powf(4.f, (c.eqHigh - 0.5f) * 2.f);
+            const float lo = eqLowLp.Process(stopped);
+            const float hi = stopped - eqHighLp.Process(stopped);
+            const float md = eqMidBp.Process(stopped);
+            eqd += (gL - 1.f) * lo + (gH - 1.f) * hi + (gM - 1.f) * md;
+        }
+
+        float outv = eqd * (c.volume * 2.f); // noon = unity
         outv = outHp.Process(outv);
         return Clampf(outv, -0.99f, 0.99f);
     }
@@ -1026,6 +1099,14 @@ int main(void)
             if(altArmed[1])
                 controls.lag = controls.knob[1];
 
+            // knobs 4/5/6 - Condor-style three band EQ
+            if(altArmed[3])
+                controls.eqLow = controls.knob[3];
+            if(altArmed[4])
+                controls.eqMid = controls.knob[4];
+            if(altArmed[5])
+                controls.eqHigh = controls.knob[5];
+
             // knob 3 - modulation waveshape
             if(altArmed[2])
             {
@@ -1040,6 +1121,9 @@ int main(void)
             controls.volume   = controls.knob[0];
             controls.wowDepth = controls.knob[1];
             controls.rate     = controls.knob[2];
+            controls.sat      = controls.knob[3];
+            controls.flavour  = controls.knob[4];
+            controls.fail     = controls.knob[5];
         }
 
         // ---- LEDs -------------------------------------------------------
