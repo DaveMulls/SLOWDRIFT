@@ -22,7 +22,7 @@
 //   ALT LAYER - hold both footswitches for 600 ms, both LEDs blink.
 //   Each knob is inert until nudged, then takes over:
 //     knob1  how much dry the dry switch passes
-//     knob2  lag: glide time between modulation values
+//     knob2  lag: centre delay the modulation swings around
 //     knob3  modulation waveshape: sine / triangle / sample+hold / saw
 //     knob4  low pass  - fully CW is off, turn back to roll off highs
 //     knob5  mid        +/-18 dB at 775 Hz, flat at noon
@@ -279,35 +279,15 @@ struct ShapedLfo
         return (shape == LFO_SH) ? shValue : LfoWave(p, shape);
     }
 
-    // Lag is scaled to the LFO period, not an absolute frequency, so "half
-    // lag" glides over half a cycle whether the LFO is at 0.5 Hz or 15 Hz.
-    inline float Lagged(float raw, float lagAmount)
+    // Just enough slew to stop sample-and-hold and saw from stepping the
+    // delay time instantly, which reads as a click rather than a pitch jump.
+    inline float Smoothed(float raw)
     {
-        const float hz       = ph.inc * ph.sr;
-        const float periodMs = 1000.f / (hz > 0.05f ? hz : 0.05f);
-        // Up to one and a half cycles of glide at full - previously half a
-        // cycle, which ran out of range before it got properly smeared.
-        const float lagMs = lagAmount * periodMs * 1.5f;
-        const float fc    = (lagMs < 0.01f)
-                                ? fcTop
-                                : (159.155f / lagMs < fcTop ? 159.155f / lagMs : fcTop);
-        lag.SetFreq(fc);
-
-        // A low pass on an LFO does not just round the corners, it shrinks the
-        // amplitude - which is why winding lag up made the modulation shallower
-        // and duller instead of lusher. Compensating for the loss at the LFO's
-        // own rate means lag changes the shape while the depth stays put.
-        const float ratio = hz / (fc > 0.01f ? fc : 0.01f);
-        float       comp  = sqrtf(1.f + ratio * ratio);
-        if(comp > 6.f)
-            comp = 6.f;
-        return lag.Process(raw) * comp;
+        lag.SetFreq(fcTop);
+        return lag.Process(raw);
     }
 
-    inline float Process(int shape, float lagAmount)
-    {
-        return Lagged(Raw(shape), lagAmount);
-    }
+    inline float Process(int shape) { return Smoothed(Raw(shape)); }
 };
 
 // Pd [delwrite~] / [vd~] with 4-point cubic interpolation, as vd~ uses.
@@ -362,7 +342,7 @@ struct PdDelay
 // Buffer lengths at 48 kHz
 enum : size_t
 {
-    SD_TAPE_LEN    = 6200,  //  128 ms
+    SD_TAPE_LEN    = 9600,  //  200 ms, headroom for the lag offset
     SD_FLANGE_LEN  = 800,   //   15 ms
     SD_TSTAPE_LEN  = 29000, //  600 ms - the big one, put this in SDRAM
     SD_TSPITCH_LEN = 6200,  //  128 ms
@@ -393,7 +373,7 @@ struct Controls
     float rate      = 0.3f; // knob 3 normally
     int   lfoShape  = LFO_SINE; // knob 3 while both footswitches are held
     float wowDepth  = 0.3f; // knob 2 normally
-    float lag       = 0.f;  // knob 2 while both footswitches are held
+    float lag       = 0.f;  // knob 2 on the alt layer: centre delay time
     float sat       = 0.3f; // knob 4 normally
     float flavour   = 0.f;  // knob 5 normally
     float fail      = 0.f;  // knob 6 normally
@@ -810,7 +790,7 @@ struct SlowDrift
         const float rawMod = (c.lfoShape == LFO_SINE)
                                  ? Clampf(w + s, -1.f, 1.f)
                                  : wowLfo.Raw(c.lfoShape);
-        const float mod    = Clampf(wowLfo.Lagged(rawMod, c.lag), -1.f, 1.f);
+        const float mod    = Clampf(wowLfo.Smoothed(rawMod), -1.f, 1.f);
         const float wowA  = mod * depth * 5.f + depth * 5.f;
 
         // vibrato branch (replaces wow when sw4 is up)
@@ -818,16 +798,24 @@ struct SlowDrift
         // Sample and hold and saw step the delay time instantly, which reads
         // as a click rather than a pitch jump, so this LFO always carries some
         // slew even with lag at zero. The lag knob extends it into a glide.
-        const float vib = vibLfo.Process(c.lfoShape, c.lag) * vdep;
+        const float vib = vibLfo.Process(c.lfoShape) * vdep;
 
         const float snag = snagSm2.Process(snagSm1.Process(snagTime));
 
+        // LAG, after the Walrus Julia: it sets the centre delay time the LFO
+        // modulates around. On a bucket brigade a longer delay means a slower
+        // clock, so the same clock wobble swings the time further - which is
+        // why the Julia goes from tight and bright to seasick detune as you
+        // open it. Both the offset and the swing scale together here.
+        const float lagMs    = c.lag * 38.f;
+        const float lagScale = 1.f + c.lag * 3.f;
+
         float delayMs;
         if(c.vibrato)
-            delayMs = 4.f + vib + snag;
+            delayMs = 4.f + lagMs + vib * lagScale + snag;
         else
-            delayMs = wowN + wowA + snag;
-        delayMs = Clampf(delayMs, 1.f, 120.f);
+            delayMs = lagMs + (wowN + wowA) * lagScale + snag;
+        delayMs = Clampf(delayMs, 1.f, 190.f);
 
         tape.Write(comp);
         float t = tape.ReadMs(delayMs) * 0.5f;
@@ -889,7 +877,7 @@ struct SlowDrift
         // 4 - tremolo
         {
             const float td = tremDepth.Process(c.wowDepth * 0.5f);
-            const float lf = tremLfo.Process(c.lfoShape, c.lag) * td + (1.f - td);
+            const float lf = tremLfo.Process(c.lfoShape) * td + (1.f - td);
             bus += f * lf * g4;
         }
 
@@ -992,6 +980,9 @@ bool          altArmed[6]       = {false, false, false, false, false, false};
 // the alt layer is left.
 float         normEntry[6]      = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 bool          normArmed[6]      = {true, true, true, true, true, true};
+uint32_t      fs1Down           = 0;
+uint32_t      flashUntil        = 0;
+bool          resetDone         = false;
 uint32_t      fs2Down           = 0;
 bool          tapeLatch         = false;
 uint32_t      bothSince         = 0;
@@ -1102,11 +1093,29 @@ int main(void)
             }
         }
 
-        // ---- footswitch 1: effect on/off --------------------------------
+        // ---- footswitch 1: effect on/off, or hold 5 s to reset ----------
         if(fsCtl[0].RisingEdge())
         {
+            fs1Down           = now;
+            resetDone         = false;
             effectBeforeCombo = controls.effectOn;
             controls.effectOn = !controls.effectOn;
+        }
+        if(fsCtl[0].Pressed() && !fsCtl[1].Pressed() && !resetDone
+           && now - fs1Down > 5000)
+        {
+            // Everything on the alt layer back to neutral. The effect toggle
+            // caused by the initial press is undone as well, so a reset does
+            // not leave the pedal switched.
+            controls.dryAmount = 0.5f;
+            controls.lag       = 0.f;
+            controls.lfoShape  = LFO_SINE;
+            controls.eqLow     = 1.0f; // low pass off
+            controls.eqMid     = 0.5f; // flat
+            controls.eqHigh    = 0.0f; // high pass off
+            controls.effectOn  = effectBeforeCombo;
+            resetDone          = true;
+            flashUntil         = now + 450;
         }
 
         // ---- footswitch 2: tap latches, hold is momentary ---------------
@@ -1179,7 +1188,13 @@ int main(void)
         }
 
         // ---- LEDs -------------------------------------------------------
-        if(altMode)
+        if(now < flashUntil)
+        {
+            // One solid flash on both to confirm the reset landed.
+            ledOut[0].Write(true);
+            ledOut[1].Write(true);
+        }
+        else if(altMode)
         {
             // Both blink together while the alt layer is live, and stay solid
             // once the knob has been caught and is actually moving the value.
