@@ -429,6 +429,7 @@ struct SlowDrift
     // --- bloom (lpg_engine)
     PdHip   lpgHp;
     PdLop   lpgAtk, lpgRel, lpgRipple, lpgKnob;
+    float   lpgOpen = 0.f;
     PdRPole lpgP1, lpgP2;
 
     // --- saturation and compressor
@@ -717,33 +718,37 @@ struct SlowDrift
         if(!c.effectOn)
             return Clampf(dry, -0.99f, 0.99f);
 
-        // ---------------- bloom / LPG (vactrol model) --------------------
+        // ---------------- bloom: low pass gate, after the Shallow Water ---
+        // Fairfield's manual: "the input's envelope is followed and used to
+        // modulate the frequency of a low pass filter. The amount of envelope
+        // is set by the LPG control." Low settings are dark, choke subtle
+        // notes and cut sustain; high settings are bright and bouncy.
+        //
+        // The envelope is deliberately asymmetric - a 2 ms attack follower and
+        // a 53 ms release follower, combined with max(). The fast one snaps
+        // the gate open on the pick, the slow one lets it fall away
+        // afterwards, and that difference IS the bloom.
         const float lpgIn  = lpgHp.Process(dry);
         const float rect   = fabsf(lpgIn);
-        const float atk    = lpgAtk.Process(rect);
-        const float rel    = lpgRel.Process(rect);
-        const float env    = lpgRipple.Process(atk > rel ? atk : rel);
-        const float knob   = lpgKnob.Process(bloomAmt);
-        // Sensitivity raised so transients swing the gate, and the resting
-        // floor reduced so it still breathes with the knob near maximum.
-        // knob = how much the gate closes between notes. At 0 it stays wide
-        // open (no bloom); at full it swings the whole range. This makes the
-        // control monotonic instead of having a single sweet spot at 2 o'clock.
-        const float envN   = Clampf(env * 18.f, 0.f, 1.f);
-        const float open_  = 1.f - knob * (1.f - envN);
-        const float o2     = open_ * open_;
-        const float cutoff = o2 * 0.98f + 0.02f; // fully open at the top now
-        const float fb     = 1.f - cutoff;
-        float       lpg    = lpgP1.Process(lpgIn * cutoff, fb);
-        lpg                = lpgP2.Process(lpg * cutoff, fb);
-        lpg *= (open_ * 0.85f + 0.15f); // deeper amplitude swing too
+        const float atk    = lpgAtk.Process(rect);   // lop~ 80, ~2 ms
+        const float rel    = lpgRel.Process(rect);   // lop~ 3,  ~53 ms
+        const float envRaw = lpgRipple.Process(atk > rel ? atk : rel);
+        // Sensitivity 6, as in the Pd patch. Raising it to 18 pinned the
+        // envelope at full scale two thirds of the time, which left the gate
+        // permanently open and made the whole thing a static low pass.
+        const float env  = Clampf(envRaw * 6.f, 0.f, 1.f);
+        const float knob = lpgKnob.Process(bloomAmt);
+        // knob * env is the swinging part; knob^2 is a resting floor, so that
+        // fully clockwise pins the gate open and fully anticlockwise closes it
+        // down to a 190 Hz whisper.
+        lpgOpen = Clampf(env * knob + knob * knob, 0.f, 1.f);
 
         // ---------------- pre-saturation sum -----------------------------
         // bloom is summed with the dry path, then high-passed at 50 Hz
         // With bloom engaged the LPG voice REPLACES the dry path - in the Pd
         // patch that is what the alt_eq switch did, and summing the dry in
         // permanently is why the gate sounded like a weak static low pass.
-        const float x = preHp50.Process(c.bloomOn ? lpg : dry);
+        const float x = preHp50.Process(dry);
 
         // ---------------- drive + saturation -----------------------------
         const float drive = driveSm.Process(1.f + c.sat * 24.f);
@@ -914,6 +919,23 @@ struct SlowDrift
             slap.Write(f);
             const float sv = slapLp.Process(slap.ReadMs(120.f)) * 0.5f;
             bus += (f + sv) * g5;
+        }
+
+        // ---------------- bloom gate -------------------------------------
+        // Shallow Water's block diagram puts the voltage controlled low pass
+        // after the delay line and before the dry/wet mix, so that is where it
+        // sits: it gates the modulated voice, not the input, and the dry blend
+        // stays clean. Two one-poles for 12 dB/oct, plus a VCA on the same
+        // control - brightness and loudness move together, which is what makes
+        // an LPG sound different from a plain filter.
+        if(c.bloomOn)
+        {
+            const float o2     = lpgOpen * lpgOpen; // vactrol-ish curve
+            const float cutoff = o2 * 0.925f + 0.025f;
+            const float fb     = 1.f - cutoff;
+            float       g      = lpgP1.Process(bus * cutoff, fb);
+            g                  = lpgP2.Process(g * cutoff, fb);
+            bus                = g * (lpgOpen * 0.65f + 0.35f);
         }
 
         // ---------------- dry blend --------------------------------------
