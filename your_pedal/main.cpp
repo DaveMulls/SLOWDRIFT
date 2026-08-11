@@ -24,9 +24,9 @@
 //     knob1  how much dry the dry switch passes
 //     knob2  lag: glide time between modulation values
 //     knob3  modulation waveshape: sine / triangle / sample+hold / saw
-//     knob4  EQ low    +/-12 dB, flat at noon
-//     knob5  EQ mid    +/-18 dB at 775 Hz, flat at noon
-//     knob6  EQ high   +/-12 dB, flat at noon
+//     knob4  low pass  - fully CW is off, turn back to roll off highs
+//     knob5  mid        +/-18 dB at 775 Hz, flat at noon
+//     knob6  high pass  - fully CCW is off, turn up to roll off bass
 
 #include "daisy_seed.h"
 #include "daisysp.h"
@@ -285,12 +285,23 @@ struct ShapedLfo
     {
         const float hz       = ph.inc * ph.sr;
         const float periodMs = 1000.f / (hz > 0.05f ? hz : 0.05f);
-        const float lagMs    = lagAmount * periodMs * 0.5f;
-        const float fc       = (lagMs < 0.01f)
-                                   ? fcTop
-                                   : (159.155f / lagMs < fcTop ? 159.155f / lagMs : fcTop);
+        // Up to one and a half cycles of glide at full - previously half a
+        // cycle, which ran out of range before it got properly smeared.
+        const float lagMs = lagAmount * periodMs * 1.5f;
+        const float fc    = (lagMs < 0.01f)
+                                ? fcTop
+                                : (159.155f / lagMs < fcTop ? 159.155f / lagMs : fcTop);
         lag.SetFreq(fc);
-        return lag.Process(raw);
+
+        // A low pass on an LFO does not just round the corners, it shrinks the
+        // amplitude - which is why winding lag up made the modulation shallower
+        // and duller instead of lusher. Compensating for the loss at the LFO's
+        // own rate means lag changes the shape while the depth stays put.
+        const float ratio = hz / (fc > 0.01f ? fc : 0.01f);
+        float       comp  = sqrtf(1.f + ratio * ratio);
+        if(comp > 6.f)
+            comp = 6.f;
+        return lag.Process(raw) * comp;
     }
 
     inline float Process(int shape, float lagAmount)
@@ -386,9 +397,9 @@ struct Controls
     float sat       = 0.3f; // knob 4 normally
     float flavour   = 0.f;  // knob 5 normally
     float fail      = 0.f;  // knob 6 normally
-    float eqLow     = 0.5f; // knob 4 on the alt layer, 0.5 = flat
+    float eqLow     = 1.0f; // knob 4 on the alt layer, 1.0 = no low pass
     float eqMid     = 0.5f; // knob 5 on the alt layer, 0.5 = flat
-    float eqHigh    = 0.5f; // knob 6 on the alt layer, 0.5 = flat
+    float eqHigh    = 0.0f; // knob 6 on the alt layer, 0.0 = no high pass
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
     bool  bloomOn  = false; // sw3
@@ -409,7 +420,8 @@ struct SlowDrift
 
     // --- input / output conditioning
     PdHip inHp, outHp, preHp50, satHp1, satHp2;
-    PdLop eqLowLp, eqHighLp;
+    PdLop eqLp1, eqLp2;
+    PdHip eqHp1, eqHp2;
     SvfBand eqMidBp;
 
     // --- bloom (lpg_engine)
@@ -494,8 +506,10 @@ struct SlowDrift
         inHp.Init(sr, 10.f);
         outHp.Init(sr, 10.f);
         preHp50.Init(sr, 50.f);
-        eqLowLp.Init(sr, 120.f);
-        eqHighLp.Init(sr, 2500.f);
+        eqLp1.Init(sr, 20000.f);
+        eqLp2.Init(sr, 20000.f);
+        eqHp1.Init(sr, 20.f);
+        eqHp2.Init(sr, 20.f);
         eqMidBp.Init(sr, 775.f, 0.85f);
         satHp1.Init(sr, 30.f);
         satHp2.Init(sr, 10.f);
@@ -912,16 +926,30 @@ struct SlowDrift
         // Bass +/-12 dB shelf, parametric-style mid +/-18 dB at 775 Hz (the
         // geometric centre of the Condor's 150 Hz - 4 kHz mid sweep), treble
         // +/-12 dB shelf. All flat at noon.
+        // LOW  knob: low pass. Fully clockwise is transparent; turning back
+        //            rolls the top off, like a tone control.
+        // MID  knob: +/-18 dB at 775 Hz, flat at noon.
+        // HIGH knob: high pass. Fully counter-clockwise is transparent;
+        //            turning up rolls the bass away.
         float eqd = stopped;
-        if(c.eqLow != 0.5f || c.eqMid != 0.5f || c.eqHigh != 0.5f)
+        if(c.eqMid != 0.5f)
         {
-            const float gL = powf(4.f, (c.eqLow - 0.5f) * 2.f);
             const float gM = powf(8.f, (c.eqMid - 0.5f) * 2.f);
-            const float gH = powf(4.f, (c.eqHigh - 0.5f) * 2.f);
-            const float lo = eqLowLp.Process(stopped);
-            const float hi = stopped - eqHighLp.Process(stopped);
-            const float md = eqMidBp.Process(stopped);
-            eqd += (gL - 1.f) * lo + (gH - 1.f) * hi + (gM - 1.f) * md;
+            eqd += (gM - 1.f) * eqMidBp.Process(stopped);
+        }
+        if(c.eqLow < 0.99f)
+        {
+            const float fc = 250.f * powf(80.f, c.eqLow); // 250 Hz .. 20 kHz
+            eqLp1.SetFreq(fc);
+            eqLp2.SetFreq(fc);
+            eqd = eqLp2.Process(eqLp1.Process(eqd));
+        }
+        if(c.eqHigh > 0.01f)
+        {
+            const float fc = 20.f * powf(75.f, c.eqHigh); // 20 Hz .. 1.5 kHz
+            eqHp1.SetFreq(fc);
+            eqHp2.SetFreq(fc);
+            eqd = eqHp2.Process(eqHp1.Process(eqd));
         }
 
         float outv = eqd * (c.volume * 2.f); // noon = unity
@@ -960,6 +988,10 @@ static constexpr float kAltDeadband = 0.03f;
 
 float         altEntry[6]       = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 bool          altArmed[6]       = {false, false, false, false, false, false};
+// Armed at boot so the knobs are live from power-up; disarmed again each time
+// the alt layer is left.
+float         normEntry[6]      = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+bool          normArmed[6]      = {true, true, true, true, true, true};
 uint32_t      fs2Down           = 0;
 bool          tapeLatch         = false;
 uint32_t      bothSince         = 0;
@@ -1057,7 +1089,17 @@ int main(void)
         {
             bothSince = 0;
             if(altMode && !fsCtl[0].Pressed() && !fsCtl[1].Pressed())
+            {
                 altMode = false;
+                // Same deal on the way out: whatever was dialled in before the
+                // alt layer stays put until a knob is actually turned, so
+                // visiting the alt layer never disturbs the main settings.
+                for(int i = 0; i < 6; i++)
+                {
+                    normEntry[i] = controls.knob[i];
+                    normArmed[i] = false;
+                }
+            }
         }
 
         // ---- footswitch 1: effect on/off --------------------------------
@@ -1118,12 +1160,22 @@ int main(void)
         }
         else
         {
-            controls.volume   = controls.knob[0];
-            controls.wowDepth = controls.knob[1];
-            controls.rate     = controls.knob[2];
-            controls.sat      = controls.knob[3];
-            controls.flavour  = controls.knob[4];
-            controls.fail     = controls.knob[5];
+            for(int i = 0; i < 6; i++)
+                if(!normArmed[i] && fabsf(controls.knob[i] - normEntry[i]) > kAltDeadband)
+                    normArmed[i] = true;
+
+            if(normArmed[0])
+                controls.volume = controls.knob[0];
+            if(normArmed[1])
+                controls.wowDepth = controls.knob[1];
+            if(normArmed[2])
+                controls.rate = controls.knob[2];
+            if(normArmed[3])
+                controls.sat = controls.knob[3];
+            if(normArmed[4])
+                controls.flavour = controls.knob[4];
+            if(normArmed[5])
+                controls.fail = controls.knob[5];
         }
 
         // ---- LEDs -------------------------------------------------------
