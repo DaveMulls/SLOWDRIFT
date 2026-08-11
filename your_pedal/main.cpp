@@ -22,7 +22,8 @@
 //   ALT LAYER - hold both footswitches for 600 ms, both LEDs blink.
 //   Each knob is inert until nudged, then takes over:
 //     knob1  how much dry the dry switch passes
-//     knob3  modulation waveshape: sine / triangle / square / saw
+//     knob2  lag: glide time between modulation values
+//     knob3  modulation waveshape: sine / triangle / sample+hold / saw
 
 #include "daisy_seed.h"
 #include "daisysp.h"
@@ -175,12 +176,13 @@ struct PdLine
 };
 
 // Bipolar LFO shapes, all -1..+1 and phase-aligned with cosine so switching
-// between them does not jump.
+// between them does not jump. Sample and hold is stateful and lives in
+// ShapedLfo below rather than in this function.
 enum LfoShape
 {
     LFO_SINE = 0,
     LFO_TRI,
-    LFO_SQUARE,
+    LFO_SH,
     LFO_SAW,
     LFO_COUNT
 };
@@ -190,7 +192,6 @@ static inline float LfoWave(float phase, int shape)
     switch(shape)
     {
         case LFO_TRI: return 4.f * fabsf(phase - 0.5f) - 1.f;
-        case LFO_SQUARE: return phase < 0.5f ? 1.f : -1.f;
         case LFO_SAW: return 1.f - 2.f * phase;
         default: return cosf(6.2831853f * phase);
     }
@@ -211,6 +212,56 @@ struct PdPhasor
         while(phase < 0.f)
             phase += 1.f;
         return phase;
+    }
+};
+
+// An LFO that owns its phase, its sample-and-hold state, and a slew stage.
+// The slew is what the lag control drives: at zero it only rounds off the
+// steps enough to keep them from clicking, wound up it turns every jump into
+// a glide.
+struct ShapedLfo
+{
+    PdPhasor ph;
+    PdLop    lag;
+    float    prevPhase = 0.f;
+    float    shValue   = 0.f;
+    uint32_t rng       = 1u;
+    float    fcTop     = 60.f;
+
+    void Init(float sr, uint32_t seed, float topCutoff)
+    {
+        ph.Init(sr);
+        lag.Init(sr, topCutoff);
+        rng   = seed;
+        fcTop = topCutoff;
+    }
+    void SetFreq(float f) { ph.SetFreq(f); }
+
+    // lagAmount 0..1 sweeps the slew from fcTop down to half a hertz
+    inline float Process(int shape, float lagAmount)
+    {
+        const float p = ph.Process();
+        if(p < prevPhase) // phase wrapped: latch a new random step
+        {
+            rng     = rng * 1664525u + 1013904223u;
+            shValue = (float)(rng >> 9) * (1.f / 4194304.f) - 1.f;
+        }
+        prevPhase = p;
+
+        const float raw = (shape == LFO_SH) ? shValue : LfoWave(p, shape);
+
+        // Lag is scaled to the LFO period, not to an absolute frequency, so
+        // "half lag" glides over half a cycle whether the LFO is at 0.5 Hz or
+        // 15 Hz. Mapping it linearly in time keeps the useful range spread
+        // across the whole knob instead of bunched at the top.
+        const float hz       = ph.inc * ph.sr;
+        const float periodMs = 1000.f / (hz > 0.05f ? hz : 0.05f);
+        const float lagMs    = lagAmount * periodMs * 0.5f;
+        const float fc       = (lagMs < 0.01f)
+                                   ? fcTop
+                                   : (159.155f / lagMs < fcTop ? 159.155f / lagMs : fcTop);
+        lag.SetFreq(fc);
+        return lag.Process(raw);
     }
 };
 
@@ -296,6 +347,8 @@ struct Controls
     float dryAmount = 0.5f; // knob 1 while both footswitches are held
     float rate      = 0.3f; // knob 3 normally
     int   lfoShape  = LFO_SINE; // knob 3 while both footswitches are held
+    float wowDepth  = 0.3f; // knob 2 normally
+    float lag       = 0.f;  // knob 2 while both footswitches are held
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
     bool  bloomOn  = false; // sw3
@@ -334,8 +387,8 @@ struct SlowDrift
     PdLine        walkLine;              // random-walk target ramp
     PdLop         walkS1, walkS2, walkHp;
     PdPhasor      sine1, sine2, sine3;   // 0.61 / 1.07 / 1.83 Hz
-    PdPhasor      vibLfo;
-    PdLop         vibDepth, altDepth, snagSm1, snagSm2, vibSlew;
+    ShapedLfo     vibLfo;
+    PdLop         vibDepth, altDepth, snagSm1, snagSm2;
     float       walkTarget = 0.f;
     int         walkTimer  = 0;
     float       snagTime   = 2.f;
@@ -366,7 +419,7 @@ struct SlowDrift
     PdDelay flange;
     PdLop         flangeMod1, flangeMod2;
     // mode 4: tremolo
-    PdPhasor tremLfo;
+    ShapedLfo tremLfo;
     PdLop    tremDepth;
     // mode 5: slapback (declared with the flavour members above)
 
@@ -427,9 +480,8 @@ struct SlowDrift
         sine3.Init(sr);
         sine3.SetFreq(1.19f);
         sine3.SetPhase(0.71f);
-        vibLfo.Init(sr);
+        vibLfo.Init(sr, 0x9E3779B9u, 60.f);
         vibDepth.Init(sr, 10.f);
-        vibSlew.Init(sr, 45.f);
         altDepth.Init(sr, 20.f);
         snagSm1.Init(sr, 1.f);
         snagSm2.Init(sr, 1.f);
@@ -460,7 +512,7 @@ struct SlowDrift
         flange.Init(sr, bFlange, SD_FLANGE_LEN);
         flangeMod1.Init(sr, 0.3f);
         flangeMod2.Init(sr, 0.3f);
-        tremLfo.Init(sr);
+        tremLfo.Init(sr, 0x85EBCA77u, 500.f);
         tremDepth.Init(sr, 10.f);
 
         tsTape.Init(sr, bTsTape, SD_TSTAPE_LEN);
@@ -675,7 +727,7 @@ struct SlowDrift
         {
             walkTimer = (int)((0.769f + Rand01() * 1.538f) * sr);
             walkTarget = Rand01() * 2.f - 1.f;
-            walkLine.Set(walkTarget, 1231.f + c.knob[1] * 1846.f);
+            walkLine.Set(walkTarget, 1231.f + c.wowDepth * 1846.f);
         }
         float w = walkS2.Process(walkS1.Process(walkLine.Process()));
         w       = (w - walkHp.Process(w)) * 1.05f;
@@ -686,17 +738,16 @@ struct SlowDrift
                          + cosf(6.2831853f * sine3.Process()))
                         * 0.221f;
 
-        const float depth = altDepth.Process(c.knob[1]);
+        const float depth = altDepth.Process(c.wowDepth);
         const float mod   = Clampf(w + s, -1.f, 1.f);
         const float wowA  = mod * depth * 5.f + depth * 5.f;
 
         // vibrato branch (replaces wow when sw4 is up)
-        const float vdep = vibDepth.Process(c.knob[1] * 3.f);
-        // Square and saw would step the delay time instantly, which reads as
-        // a click rather than a pitch jump, so the shape is slewed before it
-        // reaches the delay line. Tremolo is amplitude and takes it raw.
-        const float vshape = vibSlew.Process(LfoWave(vibLfo.Process(), c.lfoShape));
-        const float vib    = vshape * vdep;
+        const float vdep = vibDepth.Process(c.wowDepth * 3.f);
+        // Sample and hold and saw step the delay time instantly, which reads
+        // as a click rather than a pitch jump, so this LFO always carries some
+        // slew even with lag at zero. The lag knob extends it into a glide.
+        const float vib = vibLfo.Process(c.lfoShape, c.lag) * vdep;
 
         const float snag = snagSm2.Process(snagSm1.Process(snagTime));
 
@@ -766,8 +817,8 @@ struct SlowDrift
 
         // 4 - tremolo
         {
-            const float td = tremDepth.Process(c.knob[1] * 0.5f);
-            const float lf = LfoWave(tremLfo.Process(), c.lfoShape) * td + (1.f - td);
+            const float td = tremDepth.Process(c.wowDepth * 0.5f);
+            const float lf = tremLfo.Process(c.lfoShape, c.lag) * td + (1.f - td);
             bus += f * lf * g4;
         }
 
@@ -971,6 +1022,10 @@ int main(void)
             if(altArmed[0])
                 controls.dryAmount = controls.knob[0];
 
+            // knob 2 - lag: how much the modulation glides between values
+            if(altArmed[1])
+                controls.lag = controls.knob[1];
+
             // knob 3 - modulation waveshape
             if(altArmed[2])
             {
@@ -982,8 +1037,9 @@ int main(void)
         }
         else
         {
-            controls.volume = controls.knob[0];
-            controls.rate   = controls.knob[2];
+            controls.volume   = controls.knob[0];
+            controls.wowDepth = controls.knob[1];
+            controls.rate     = controls.knob[2];
         }
 
         // ---- LEDs -------------------------------------------------------
