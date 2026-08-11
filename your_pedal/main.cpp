@@ -241,9 +241,9 @@ enum : size_t
 {
     SD_TAPE_LEN    = 6200,  //  128 ms
     SD_FLANGE_LEN  = 800,   //   15 ms
-    SD_SLAP_LEN    = 7400,  //  150 ms
     SD_TSTAPE_LEN  = 29000, //  600 ms - the big one, put this in SDRAM
-    SD_TSPITCH_LEN = 6200   //  128 ms
+    SD_TSPITCH_LEN = 6200,  //  128 ms
+    SD_SLAP_LEN    = 7400   //  150 ms
 };
 
 // Pd [noise~]
@@ -263,6 +263,10 @@ struct PdNoise
 struct Controls
 {
     float knob[6]  = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    // Values that live behind the alt layer. These are latched, not read
+    // straight off a knob, so the primary control keeps its position.
+    float volume    = 0.5f; // knob 1 normally
+    float dryAmount = 0.5f; // knob 1 while both footswitches are held
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
     bool  bloomOn  = false; // sw3
@@ -318,10 +322,13 @@ struct SlowDrift
 
     // --- flavour bus
     PdLine  modeGain[6];
+    PdDelay slap;
+    PdLop   slapLp;
     int   currentMode = -1;
     // mode 1: harmonic
-    PdLop   ladEnvLp;
-    float   lad0 = 0.f, lad1 = 0.f, lad2 = 0.f, lad3 = 0.f, ladEnv = 0.f;
+    // Knobs filter: topology-preserving 2-pole state variable low pass
+    float kf1 = 0.f, kf2 = 0.f, kfA1 = 0.f, kfA2 = 0.f, kfA3 = 0.f;
+    float kg1 = 0.f, kg2 = 0.f, kgA1 = 0.f, kgA2 = 0.f, kgA3 = 0.f;
     // mode 2: alt EQ
     PdHip   f2h1, f2h2;
     PdLop   f2l1, f2l2;
@@ -332,9 +339,7 @@ struct SlowDrift
     // mode 4: tremolo
     PdPhasor tremLfo;
     PdLop    tremDepth;
-    // mode 5: slap
-    PdDelay slap;
-    PdLop         slapLp;
+    // mode 5: slapback (declared with the flavour members above)
 
     // --- tape stop
     PdDelay tsTape;
@@ -356,9 +361,9 @@ struct SlowDrift
     void Init(float sampleRate,
               float* bTape,
               float* bFlange,
-              float* bSlap,
               float* bTsTape,
-              float* bTsPitch)
+              float* bTsPitch,
+              float* bSlap)
     {
         sr = sampleRate;
 
@@ -382,16 +387,16 @@ struct SlowDrift
         wowN2.Init(sr, 15.f);
         wowN3.Init(sr, 8.f);
         walkLine.Init(sr, 0.f);
-        walkS1.Init(sr, 0.5f);
-        walkS2.Init(sr, 0.5f);
-        walkHp.Init(sr, 0.3f);
+        walkS1.Init(sr, 0.325f);
+        walkS2.Init(sr, 0.325f);
+        walkHp.Init(sr, 0.195f);
         sine1.Init(sr);
-        sine1.SetFreq(0.61f);
+        sine1.SetFreq(0.397f);
         sine2.Init(sr);
-        sine2.SetFreq(1.07f);
+        sine2.SetFreq(0.696f);
         sine2.SetPhase(0.37f);
         sine3.Init(sr);
-        sine3.SetFreq(1.83f);
+        sine3.SetFreq(1.19f);
         sine3.SetPhase(0.71f);
         vibLfo.Init(sr);
         vibDepth.Init(sr, 10.f);
@@ -402,8 +407,21 @@ struct SlowDrift
 
         for(int i = 0; i < 6; i++)
             modeGain[i].Init(sr, i == 0 ? 1.f : 0.f);
+        slap.Init(sr, bSlap, SD_SLAP_LEN);
+        slapLp.Init(sr, 4000.f);
 
-        ladEnvLp.Init(sr, 8.f);
+        {
+            const float g = tanf(3.14159265f * 3600.f / sr), k = 1.f / 1.7f;
+            kfA1          = 1.f / (1.f + g * (g + k));
+            kfA2          = g * kfA1;
+            kfA3          = g * kfA2;
+        }
+        {
+            const float g = tanf(3.14159265f * 4200.f / sr), k = 1.f / 0.707f;
+            kgA1          = 1.f / (1.f + g * (g + k));
+            kgA2          = g * kgA1;
+            kgA3          = g * kgA2;
+        }
         f2h1.Init(sr, 500.f);
         f2h2.Init(sr, 500.f);
         f2l1.Init(sr, 1800.f);
@@ -414,8 +432,6 @@ struct SlowDrift
         flangeMod2.Init(sr, 0.3f);
         tremLfo.Init(sr);
         tremDepth.Init(sr, 10.f);
-        slap.Init(sr, bSlap, SD_SLAP_LEN);
-        slapLp.Init(sr, 4000.f);
 
         tsTape.Init(sr, bTsTape, SD_TSTAPE_LEN);
         tsPitch.Init(sr, bTsPitch, SD_TSPITCH_LEN);
@@ -508,13 +524,24 @@ struct SlowDrift
             }
             else
             {
-                tsRate.Set(1.f, 350.f);     // accelerate back up: pitch rises
-                tsTapeGain.Set(1.f, 120.f);
-                tsStage = 1;
-                tsTimer = (int)(0.350f * sr);
+                // Brief mute so the read head can be reset without a click.
+                tsTapeGain.Set(0.f, 15.f);
+                tsStage = 3;
+                tsTimer = (int)(0.015f * sr);
             }
         }
-        if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
+        if(tsStage == 3 && (tsTimer -= blockSize) <= 0)
+        {
+            // Reset to minimum so the spin-up has room to grow. Without this
+            // the delay sat clamped at the ceiling, d(delay)/dt was zero, and
+            // the restart produced no pitch effect at all.
+            tsResetPending = true;
+            tsRate.Set(1.f, 500.f); // accelerate from a standstill: pitch rises
+            tsTapeGain.Set(1.f, 260.f);
+            tsStage = 1;
+            tsTimer = (int)(0.500f * sr);
+        }
+        else if(tsStage == 1 && (tsTimer -= blockSize) <= 0)
         {
             // Spin-up leaves ~200 ms of accumulated lag. Bleeding it off as a
             // pitch drift left the pedal laggy for seconds, so instead the
@@ -549,15 +576,17 @@ struct SlowDrift
         const float knob   = lpgKnob.Process(bloomAmt);
         // Sensitivity raised so transients swing the gate, and the resting
         // floor reduced so it still breathes with the knob near maximum.
-        const float open_  = Clampf(Clampf(env * 10.f, 0.f, 1.f) * knob
-                                        + knob * knob * 0.5f,
-                                    0.f, 1.f);
+        // knob = how much the gate closes between notes. At 0 it stays wide
+        // open (no bloom); at full it swings the whole range. This makes the
+        // control monotonic instead of having a single sweet spot at 2 o'clock.
+        const float envN   = Clampf(env * 18.f, 0.f, 1.f);
+        const float open_  = 1.f - knob * (1.f - envN);
         const float o2     = open_ * open_;
         const float cutoff = o2 * 0.98f + 0.02f; // fully open at the top now
         const float fb     = 1.f - cutoff;
         float       lpg    = lpgP1.Process(lpgIn * cutoff, fb);
         lpg                = lpgP2.Process(lpg * cutoff, fb);
-        lpg *= (open_ * 0.65f + 0.35f);
+        lpg *= (open_ * 0.85f + 0.15f); // deeper amplitude swing too
 
         // ---------------- pre-saturation sum -----------------------------
         // bloom is summed with the dry path, then high-passed at 50 Hz
@@ -614,9 +643,9 @@ struct SlowDrift
         // random-walk branch
         if(--walkTimer <= 0)
         {
-            walkTimer = (int)((0.500f + Rand01()) * sr);
+            walkTimer = (int)((0.769f + Rand01() * 1.538f) * sr);
             walkTarget = Rand01() * 2.f - 1.f;
-            walkLine.Set(walkTarget, 800.f + c.knob[1] * 1200.f);
+            walkLine.Set(walkTarget, 1231.f + c.knob[1] * 1846.f);
         }
         float w = walkS2.Process(walkS1.Process(walkLine.Process()));
         w       = (w - walkHp.Process(w)) * 1.05f;
@@ -665,21 +694,24 @@ struct SlowDrift
         // 0 - clean
         bus += f * g0;
 
-        // 1 - chewy resonant low pass. Four-pole ladder with saturation in
-        //     the feedback path, cutoff tracking the playing envelope so it
-        //     opens on attacks and closes as notes decay.
+        // 1 - the Knobs filter. Two-pole low pass at 3 kHz with mild
+        //     resonance: keeps the 2-4 kHz harmonics that carry pick detail,
+        //     drops the fizz and string noise above 6 kHz. Rounded, not dark.
         {
-            ladEnv = ladEnvLp.Process(fabsf(f));
-            const float fc  = Clampf(220.f + ladEnv * 4200.f, 120.f, 6000.f);
-            const float g   = Clampf(2.f * sinf(3.14159265f * fc / sr), 0.f, 1.f);
-            const float res = 3.6f;
-            float       u   = f * 1.6f - res * (lad3 - 0.4f * f);
-            u               = FastTanh(u);
-            lad0 += g * (u - lad0);
-            lad1 += g * (lad0 - lad1);
-            lad2 += g * (lad1 - lad2);
-            lad3 += g * (lad2 - lad3);
-            bus += lad3 * 1.9f * g1;
+            // Stage 1: resonant peak at 3.6 kHz keeps pick detail present.
+            float v3 = f - kf2;
+            float v1 = kfA1 * kf1 + kfA2 * v3;
+            float v2 = kf2 + kfA2 * kf1 + kfA3 * v3;
+            kf1      = 2.f * v1 - kf1;
+            kf2      = 2.f * v2 - kf2;
+            // Stage 2: Butterworth at 4.2 kHz, taking the slope to 24 dB/oct
+            // so everything above the peak falls away quickly.
+            v3       = v2 - kg2;
+            v1       = kgA1 * kg1 + kgA2 * v3;
+            float w2 = kg2 + kgA2 * kg1 + kgA3 * v3;
+            kg1      = 2.f * v1 - kg1;
+            kg2      = 2.f * w2 - kg2;
+            bus += w2 * 1.0f * g1;
         }
 
         // 2 - alt EQ
@@ -705,7 +737,7 @@ struct SlowDrift
             bus += f * lf * g4;
         }
 
-        // 5 - slap
+        // 5 - slapback
         {
             slap.Write(f);
             const float sv = slapLp.Process(slap.ReadMs(120.f)) * 0.5f;
@@ -717,7 +749,7 @@ struct SlowDrift
         // to the tape-stop envelope and the output level knob like everything
         // else. Adding it after the level control made it far too loud.
         if(c.dryOn)
-            bus += comp * 0.25f; // roughly level with the wet bus
+            bus += comp * c.dryAmount * 0.5f; // depth set on the alt layer
 
         // ---------------- tape stop --------------------------------------
         tsTape.Write(bus);
@@ -734,7 +766,7 @@ struct SlowDrift
         float stopped = tsTape.ReadMs(tsDelayMs) * tsTapeGain.Process();
 
         // ---------------- output -----------------------------------------
-        float outv = stopped * (c.knob[0] * 2.f); // noon = unity
+        float outv = stopped * (c.volume * 2.f); // noon = unity
         outv = outHp.Process(outv);
         return Clampf(outv, -0.99f, 0.99f);
     }
@@ -760,11 +792,16 @@ constexpr Pin LED[2]        = {seed::D22, seed::D23};
 static float DSY_SDRAM_BSS bufTsTape[SD_TSTAPE_LEN];
 static float               bufTape[SD_TAPE_LEN];
 static float               bufFlange[SD_FLANGE_LEN];
-static float               bufSlap[SD_SLAP_LEN];
 static float               bufTsPitch[SD_TSPITCH_LEN];
+static float               bufSlap[SD_SLAP_LEN];
 
-uint32_t      fs2Down   = 0;
-bool          tapeLatch = false;
+uint32_t      fs2Down           = 0;
+bool          tapeLatch         = false;
+uint32_t      bothSince         = 0;
+bool          altMode           = false;
+bool          altCaught         = false;
+bool          comboUsed         = false;
+bool          effectBeforeCombo = false;
 
 DaisySeed     hw;
 Controls      controls;
@@ -794,7 +831,7 @@ int main(void)
     hw.SetAudioBlockSize(2);
 
     const float sr = hw.AudioSampleRate();
-    pedal.Init(sr, bufTape, bufFlange, bufSlap, bufTsTape, bufTsPitch);
+    pedal.Init(sr, bufTape, bufFlange, bufTsTape, bufTsPitch, bufSlap);
 
     AdcChannelConfig adcCfg[6];
     for(int i = 0; i < 6; i++)
@@ -827,22 +864,87 @@ int main(void)
 
         for(int i = 0; i < 2; i++)
             fsCtl[i].Debounce();
+
+        const uint32_t now      = System::GetNow();
+        const bool     bothDown = fsCtl[0].Pressed() && fsCtl[1].Pressed();
+
+        // ---- entering the alt layer -------------------------------------
+        // Hold both switches for 600 ms. The individual presses will already
+        // have toggled the effect and armed the tape stop, so those are undone
+        // on entry rather than made to feel laggy by waiting to act.
+        if(bothDown)
+        {
+            if(bothSince == 0)
+                bothSince = now;
+            else if(!altMode && now - bothSince > 600)
+            {
+                altMode   = true;
+                altCaught = false;
+                controls.effectOn = effectBeforeCombo;
+                tapeLatch         = false;
+                comboUsed         = true;
+            }
+        }
+        else
+        {
+            bothSince = 0;
+            if(altMode && !fsCtl[0].Pressed() && !fsCtl[1].Pressed())
+                altMode = false;
+        }
+
+        // ---- footswitch 1: effect on/off --------------------------------
         if(fsCtl[0].RisingEdge())
+        {
+            effectBeforeCombo = controls.effectOn;
             controls.effectOn = !controls.effectOn;
-        // fs2: a quick tap toggles the latch, holding past 400 ms is momentary
+        }
+
+        // ---- footswitch 2: tap latches, hold is momentary ---------------
         if(fsCtl[1].RisingEdge())
-            fs2Down = System::GetNow();
+            fs2Down = now;
         if(fsCtl[1].FallingEdge())
         {
-            if(System::GetNow() - fs2Down < 400)
-                tapeLatch = !tapeLatch; // tap
+            if(comboUsed)
+                comboUsed = false; // this release was part of the combo
+            else if(now - fs2Down < 400)
+                tapeLatch = !tapeLatch;
             else
-                tapeLatch = false; // was a hold
+                tapeLatch = false;
         }
-        controls.tapeStop = tapeLatch || fsCtl[1].Pressed();
+        controls.tapeStop = !altMode && (tapeLatch || fsCtl[1].Pressed());
 
-        ledOut[0].Write(controls.effectOn);
-        ledOut[1].Write(controls.tapeStop);
+        // ---- knob 1 addresses volume, or dry amount on the alt layer ----
+        if(altMode)
+        {
+            // Value catching: the knob is physically wherever the volume was
+            // left, so the dry amount does not move until the knob is swept
+            // through its stored position. Without this every entry into the
+            // alt layer would slam the parameter to the knob's position.
+            const float k = controls.knob[0];
+            if(!altCaught && fabsf(k - controls.dryAmount) < 0.03f)
+                altCaught = true;
+            if(altCaught)
+                controls.dryAmount = k;
+        }
+        else
+        {
+            controls.volume = controls.knob[0];
+        }
+
+        // ---- LEDs -------------------------------------------------------
+        if(altMode)
+        {
+            // Both blink together while the alt layer is live, and stay solid
+            // once the knob has been caught and is actually moving the value.
+            const bool fast = (now % 300) < 150;
+            ledOut[0].Write(altCaught ? true : fast);
+            ledOut[1].Write(altCaught ? true : fast);
+        }
+        else
+        {
+            ledOut[0].Write(controls.effectOn);
+            ledOut[1].Write(controls.tapeStop);
+        }
 
         System::Delay(1);
     }
