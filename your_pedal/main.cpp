@@ -16,7 +16,7 @@
 //   sw2    compressor makeup
 //   sw3    alt EQ (removes the pre-saturation dry path)
 //   sw4    vibrato mode (replaces wow with a clean LFO)
-//   fs1    effect on/off (latching)
+//   fs1    effect on/off (latching). Hold 4 s alone to reset the alt layer.
 //   fs2    tape stop (tap latches, hold is momentary)
 //
 //   ALT LAYER - hold both footswitches for 600 ms, both LEDs blink.
@@ -220,7 +220,13 @@ static inline float LfoWave(float phase, int shape)
     switch(shape)
     {
         case LFO_TRI: return 4.f * fabsf(phase - 0.5f) - 1.f;
-        case LFO_SAW: return 1.f - 2.f * phase;
+        // A true saw jumps from -1 straight back to +1, and an instantaneous
+        // jump in delay time is a pop rather than a pitch move. This ramps
+        // down over 88% of the cycle then flies back over the remaining 12%:
+        // still unmistakably a sawtooth, but the return is a fast swoop.
+        case LFO_SAW:
+            return phase < 0.88f ? 1.f - 2.f * (phase / 0.88f)
+                                 : -1.f + 2.f * ((phase - 0.88f) / 0.12f);
         default: return cosf(6.2831853f * phase);
     }
 }
@@ -279,15 +285,27 @@ struct ShapedLfo
         return (shape == LFO_SH) ? shValue : LfoWave(p, shape);
     }
 
-    // Just enough slew to stop sample-and-hold and saw from stepping the
-    // delay time instantly, which reads as a click rather than a pitch jump.
-    inline float Smoothed(float raw)
+    // Sample and hold still steps instantly, so it gets a glide scaled to the
+    // LFO period - about a tenth of a cycle. Slow settings stay percussive,
+    // fast settings stop popping, and the character holds across the rate
+    // range instead of being tuned for one speed. The continuous shapes only
+    // need the light fixed slew.
+    inline float Smoothed(float raw, int shape)
     {
-        lag.SetFreq(fcTop);
+        float fc = fcTop;
+        if(shape == LFO_SH)
+        {
+            const float hz = ph.inc * ph.sr;
+            const float f  = 1.6f * (hz > 0.05f ? hz : 0.05f);
+            fc             = f < fcTop ? f : fcTop;
+            if(fc < 1.2f)
+                fc = 1.2f; // never so slow that the steps vanish entirely
+        }
+        lag.SetFreq(fc);
         return lag.Process(raw);
     }
 
-    inline float Process(int shape) { return Smoothed(Raw(shape)); }
+    inline float Process(int shape) { return Smoothed(Raw(shape), shape); }
 };
 
 // Pd [delwrite~] / [vd~] with 4-point cubic interpolation, as vd~ uses.
@@ -401,6 +419,10 @@ struct SlowDrift
     // --- input / output conditioning
     PdHip inHp, outHp, preHp50, satHp1, satHp2;
     PdLop eqLp1, eqLp2;
+    // Alt-layer values arrive stepped at control rate. Fed straight into a
+    // delay time or a filter cutoff, each step is an instantaneous jump - a
+    // click - and turning the knob produces a stream of them. Smooth them all.
+    PdLop lagSm, drySm, eqLowSm, eqMidSm, eqHighSm;
     PdHip eqHp1, eqHp2;
     SvfBand eqMidBp;
 
@@ -486,6 +508,11 @@ struct SlowDrift
         inHp.Init(sr, 10.f);
         outHp.Init(sr, 10.f);
         preHp50.Init(sr, 50.f);
+        lagSm.Init(sr, 4.f);
+        drySm.Init(sr, 8.f);
+        eqLowSm.Init(sr, 6.f);
+        eqMidSm.Init(sr, 6.f);
+        eqHighSm.Init(sr, 6.f);
         eqLp1.Init(sr, 20000.f);
         eqLp2.Init(sr, 20000.f);
         eqHp1.Init(sr, 20.f);
@@ -790,7 +817,7 @@ struct SlowDrift
         const float rawMod = (c.lfoShape == LFO_SINE)
                                  ? Clampf(w + s, -1.f, 1.f)
                                  : wowLfo.Raw(c.lfoShape);
-        const float mod    = Clampf(wowLfo.Smoothed(rawMod), -1.f, 1.f);
+        const float mod    = Clampf(wowLfo.Smoothed(rawMod, c.lfoShape), -1.f, 1.f);
         const float wowA  = mod * depth * 5.f + depth * 5.f;
 
         // vibrato branch (replaces wow when sw4 is up)
@@ -807,8 +834,9 @@ struct SlowDrift
         // clock, so the same clock wobble swings the time further - which is
         // why the Julia goes from tight and bright to seasick detune as you
         // open it. Both the offset and the swing scale together here.
-        const float lagMs    = c.lag * 38.f;
-        const float lagScale = 1.f + c.lag * 3.f;
+        const float lagS     = lagSm.Process(c.lag);
+        const float lagMs    = lagS * 38.f;
+        const float lagScale = 1.f + lagS * 3.f;
 
         float delayMs;
         if(c.vibrato)
@@ -893,7 +921,7 @@ struct SlowDrift
         // to the tape-stop envelope and the output level knob like everything
         // else. Adding it after the level control made it far too loud.
         if(c.dryOn)
-            bus += comp * c.dryAmount * 0.5f; // depth set on the alt layer
+            bus += comp * drySm.Process(c.dryAmount) * 0.5f;
 
         // ---------------- tape stop --------------------------------------
         tsTape.Write(bus);
@@ -919,22 +947,26 @@ struct SlowDrift
         // MID  knob: +/-18 dB at 775 Hz, flat at noon.
         // HIGH knob: high pass. Fully counter-clockwise is transparent;
         //            turning up rolls the bass away.
+        const float eL = eqLowSm.Process(c.eqLow);
+        const float eM = eqMidSm.Process(c.eqMid);
+        const float eH = eqHighSm.Process(c.eqHigh);
+
         float eqd = stopped;
-        if(c.eqMid != 0.5f)
+        if(eM < 0.499f || eM > 0.501f)
         {
-            const float gM = powf(8.f, (c.eqMid - 0.5f) * 2.f);
+            const float gM = powf(8.f, (eM - 0.5f) * 2.f);
             eqd += (gM - 1.f) * eqMidBp.Process(stopped);
         }
-        if(c.eqLow < 0.99f)
+        if(eL < 0.99f)
         {
-            const float fc = 250.f * powf(80.f, c.eqLow); // 250 Hz .. 20 kHz
+            const float fc = 250.f * powf(80.f, eL); // 250 Hz .. 20 kHz
             eqLp1.SetFreq(fc);
             eqLp2.SetFreq(fc);
             eqd = eqLp2.Process(eqLp1.Process(eqd));
         }
-        if(c.eqHigh > 0.01f)
+        if(eH > 0.01f)
         {
-            const float fc = 20.f * powf(75.f, c.eqHigh); // 20 Hz .. 1.5 kHz
+            const float fc = 20.f * powf(75.f, eH); // 20 Hz .. 1.5 kHz
             eqHp1.SetFreq(fc);
             eqHp2.SetFreq(fc);
             eqd = eqHp2.Process(eqHp1.Process(eqd));
@@ -982,6 +1014,8 @@ float         normEntry[6]      = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 bool          normArmed[6]      = {true, true, true, true, true, true};
 uint32_t      fs1Down           = 0;
 uint32_t      flashUntil        = 0;
+uint32_t      flashStart        = 0;
+bool          holdRestored      = false;
 bool          resetDone         = false;
 uint32_t      fs2Down           = 0;
 bool          tapeLatch         = false;
@@ -1098,11 +1132,21 @@ int main(void)
         {
             fs1Down           = now;
             resetDone         = false;
+            holdRestored      = false;
             effectBeforeCombo = controls.effectOn;
             controls.effectOn = !controls.effectOn;
         }
+        // A press toggles the effect immediately, which is what a footswitch
+        // has to do. But once it has been held past 600 ms it is clearly not a
+        // stomp, so the toggle is undone right there - long before the reset
+        // fires - and holding to reset leaves the pedal exactly as it was.
+        if(fsCtl[0].Pressed() && !holdRestored && now - fs1Down > 600)
+        {
+            controls.effectOn = effectBeforeCombo;
+            holdRestored      = true;
+        }
         if(fsCtl[0].Pressed() && !fsCtl[1].Pressed() && !resetDone
-           && now - fs1Down > 5000)
+           && now - fs1Down > 4000)
         {
             // Everything on the alt layer back to neutral. The effect toggle
             // caused by the initial press is undone as well, so a reset does
@@ -1113,9 +1157,9 @@ int main(void)
             controls.eqLow     = 1.0f; // low pass off
             controls.eqMid     = 0.5f; // flat
             controls.eqHigh    = 0.0f; // high pass off
-            controls.effectOn  = effectBeforeCombo;
             resetDone          = true;
-            flashUntil         = now + 450;
+            flashStart         = now;
+            flashUntil         = now + 900; // three 150 ms flashes
         }
 
         // ---- footswitch 2: tap latches, hold is momentary ---------------
@@ -1190,9 +1234,10 @@ int main(void)
         // ---- LEDs -------------------------------------------------------
         if(now < flashUntil)
         {
-            // One solid flash on both to confirm the reset landed.
-            ledOut[0].Write(true);
-            ledOut[1].Write(true);
+            // Three flashes on both LEDs to confirm the reset landed.
+            const bool on = ((now - flashStart) % 300) < 150;
+            ledOut[0].Write(on);
+            ledOut[1].Write(on);
         }
         else if(altMode)
         {
