@@ -17,7 +17,12 @@
 //   sw3    alt EQ (removes the pre-saturation dry path)
 //   sw4    vibrato mode (replaces wow with a clean LFO)
 //   fs1    effect on/off (latching)
-//   fs2    tape stop (hold)
+//   fs2    tape stop (tap latches, hold is momentary)
+//
+//   ALT LAYER - hold both footswitches for 600 ms, both LEDs blink.
+//   Each knob is inert until nudged, then takes over:
+//     knob1  how much dry the dry switch passes
+//     knob3  modulation waveshape: sine / triangle / square / saw
 
 #include "daisy_seed.h"
 #include "daisysp.h"
@@ -169,6 +174,28 @@ struct PdLine
     }
 };
 
+// Bipolar LFO shapes, all -1..+1 and phase-aligned with cosine so switching
+// between them does not jump.
+enum LfoShape
+{
+    LFO_SINE = 0,
+    LFO_TRI,
+    LFO_SQUARE,
+    LFO_SAW,
+    LFO_COUNT
+};
+
+static inline float LfoWave(float phase, int shape)
+{
+    switch(shape)
+    {
+        case LFO_TRI: return 4.f * fabsf(phase - 0.5f) - 1.f;
+        case LFO_SQUARE: return phase < 0.5f ? 1.f : -1.f;
+        case LFO_SAW: return 1.f - 2.f * phase;
+        default: return cosf(6.2831853f * phase);
+    }
+}
+
 // Pd [phasor~] : 0..1 ramp
 struct PdPhasor
 {
@@ -267,6 +294,8 @@ struct Controls
     // straight off a knob, so the primary control keeps its position.
     float volume    = 0.5f; // knob 1 normally
     float dryAmount = 0.5f; // knob 1 while both footswitches are held
+    float rate      = 0.3f; // knob 3 normally
+    int   lfoShape  = LFO_SINE; // knob 3 while both footswitches are held
     bool  dryOn    = false; // sw1
     bool  compOn   = false; // sw2
     bool  bloomOn  = false; // sw3
@@ -306,7 +335,7 @@ struct SlowDrift
     PdLop         walkS1, walkS2, walkHp;
     PdPhasor      sine1, sine2, sine3;   // 0.61 / 1.07 / 1.83 Hz
     PdPhasor      vibLfo;
-    PdLop         vibDepth, altDepth, snagSm1, snagSm2;
+    PdLop         vibDepth, altDepth, snagSm1, snagSm2, vibSlew;
     float       walkTarget = 0.f;
     int         walkTimer  = 0;
     float       snagTime   = 2.f;
@@ -400,6 +429,7 @@ struct SlowDrift
         sine3.SetPhase(0.71f);
         vibLfo.Init(sr);
         vibDepth.Init(sr, 10.f);
+        vibSlew.Init(sr, 45.f);
         altDepth.Init(sr, 20.f);
         snagSm1.Init(sr, 1.f);
         snagSm2.Init(sr, 1.f);
@@ -458,8 +488,8 @@ struct SlowDrift
         }
 
         // LFO rates follow knob3
-        vibLfo.SetFreq(0.15f + c.knob[2] * 6.8f);
-        tremLfo.SetFreq(0.5f + c.knob[2] * 14.5f);
+        vibLfo.SetFreq(0.15f + c.rate * 6.8f);
+        tremLfo.SetFreq(0.5f + c.rate * 14.5f);
 
         // knob6 drives either bloom or failure depending on the bloom switch.
         // The inactive one holds its last position rather than following along.
@@ -635,10 +665,10 @@ struct SlowDrift
         float n = wowN3.Process(wowN2.Process(wowN1.Process(noise.Process()))) * 1000.f;
         // clamp the excursion to the pedestal so the sum stays positive and
         // smooth instead of slamming into the 1 ms floor
-        const float ped = c.knob[2] * 6.f;
+        const float ped = c.rate * 6.f;
         n               = Clampf(n, -ped, 18.f);
-        const float k3   = c.knob[2] / 3.f;
-        const float wowN = (n + c.knob[2] * 6.f) * k3;
+        const float k3   = c.rate / 3.f;
+        const float wowN = (n + c.rate * 6.f) * k3;
 
         // random-walk branch
         if(--walkTimer <= 0)
@@ -662,7 +692,11 @@ struct SlowDrift
 
         // vibrato branch (replaces wow when sw4 is up)
         const float vdep = vibDepth.Process(c.knob[1] * 3.f);
-        const float vib  = cosf(6.2831853f * vibLfo.Process()) * vdep;
+        // Square and saw would step the delay time instantly, which reads as
+        // a click rather than a pitch jump, so the shape is slewed before it
+        // reaches the delay line. Tremolo is amplitude and takes it raw.
+        const float vshape = vibSlew.Process(LfoWave(vibLfo.Process(), c.lfoShape));
+        const float vib    = vshape * vdep;
 
         const float snag = snagSm2.Process(snagSm1.Process(snagTime));
 
@@ -733,7 +767,7 @@ struct SlowDrift
         // 4 - tremolo
         {
             const float td = tremDepth.Process(c.knob[1] * 0.5f);
-            const float lf = cosf(6.2831853f * tremLfo.Process()) * td + (1.f - td);
+            const float lf = LfoWave(tremLfo.Process(), c.lfoShape) * td + (1.f - td);
             bus += f * lf * g4;
         }
 
@@ -795,11 +829,17 @@ static float               bufFlange[SD_FLANGE_LEN];
 static float               bufTsPitch[SD_TSPITCH_LEN];
 static float               bufSlap[SD_SLAP_LEN];
 
+// How far knob 1 must turn before it takes over an alt-layer parameter.
+// 0.03 is about 8 degrees of a 270-degree pot: clearly deliberate, and far
+// above the residual ADC noise left after AnalogControl's smoothing.
+static constexpr float kAltDeadband = 0.03f;
+
+float         altEntry[6]       = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+bool          altArmed[6]       = {false, false, false, false, false, false};
 uint32_t      fs2Down           = 0;
 bool          tapeLatch         = false;
 uint32_t      bothSince         = 0;
 bool          altMode           = false;
-bool          altCaught         = false;
 bool          comboUsed         = false;
 bool          effectBeforeCombo = false;
 
@@ -878,8 +918,12 @@ int main(void)
                 bothSince = now;
             else if(!altMode && now - bothSince > 600)
             {
-                altMode   = true;
-                altCaught = false;
+                altMode = true;
+                for(int i = 0; i < 6; i++)
+                {
+                    altEntry[i] = controls.knob[i];
+                    altArmed[i] = false;
+                }
                 controls.effectOn = effectBeforeCombo;
                 tapeLatch         = false;
                 comboUsed         = true;
@@ -916,19 +960,30 @@ int main(void)
         // ---- knob 1 addresses volume, or dry amount on the alt layer ----
         if(altMode)
         {
-            // Value catching: the knob is physically wherever the volume was
-            // left, so the dry amount does not move until the knob is swept
-            // through its stored position. Without this every entry into the
-            // alt layer would slam the parameter to the knob's position.
-            const float k = controls.knob[0];
-            if(!altCaught && fabsf(k - controls.dryAmount) < 0.03f)
-                altCaught = true;
-            if(altCaught)
-                controls.dryAmount = k;
+            // Move to engage, per knob. Each one is inert until turned past
+            // kAltDeadband from where it sat on entry - a deliberate nudge,
+            // well clear of ADC jitter or knocking the pedal.
+            for(int i = 0; i < 6; i++)
+                if(!altArmed[i] && fabsf(controls.knob[i] - altEntry[i]) > kAltDeadband)
+                    altArmed[i] = true;
+
+            // knob 1 - how much dry the dry switch lets through
+            if(altArmed[0])
+                controls.dryAmount = controls.knob[0];
+
+            // knob 3 - modulation waveshape
+            if(altArmed[2])
+            {
+                int sh = (int)(controls.knob[2] * (float)LFO_COUNT);
+                if(sh >= LFO_COUNT)
+                    sh = LFO_COUNT - 1;
+                controls.lfoShape = sh;
+            }
         }
         else
         {
             controls.volume = controls.knob[0];
+            controls.rate   = controls.knob[2];
         }
 
         // ---- LEDs -------------------------------------------------------
@@ -936,9 +991,10 @@ int main(void)
         {
             // Both blink together while the alt layer is live, and stay solid
             // once the knob has been caught and is actually moving the value.
+            // Both LEDs blink for the whole time the alt layer is held.
             const bool fast = (now % 300) < 150;
-            ledOut[0].Write(altCaught ? true : fast);
-            ledOut[1].Write(altCaught ? true : fast);
+            ledOut[0].Write(fast);
+            ledOut[1].Write(fast);
         }
         else
         {
